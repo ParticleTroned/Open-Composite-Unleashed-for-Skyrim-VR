@@ -1,12 +1,12 @@
 #include "stdafx.h"
 
 #include "Config.h"
+#include "ExternalUpscalerConfig.h"
 #include "ExternalUpscalerState.h"
 #include "ini.h"
 
 #include <algorithm>
 #include <codecvt>
-#include <cmath>
 #include <locale>
 #include <string>
 
@@ -435,52 +435,37 @@ static float dlss_preset_render_scale(int preset)
 	}
 }
 
-static float external_upscaler_mip_bias(float renderScale)
-{
-	float clampedScale = std::max(0.1f, std::min(1.0f, renderScale));
-	return std::log2(clampedScale) - 1.0f;
-}
-
 static void publish_external_upscaler_config(const Config& cfg)
 {
-	const bool fsrTemporalActive = cfg.FsrEnabled()
-	    && (cfg.FsrRenderScale() < 0.999f || cfg.FsrNativeAA());
-	const bool dlssTemporalActive = cfg.DlssEnabled()
-	    && !cfg.FsrEnabled()
-	    && (cfg.FsrRenderScale() < 0.999f || cfg.DlssPreset() == 4);
-	const bool dlaaPostActive = cfg.DlaaEnabled();
-	const bool active = fsrTemporalActive || dlssTemporalActive || dlaaPostActive;
+	ExternalUpscalerConfig::Input input{};
+#ifdef OC_HAS_FSR3
+	input.fsr3Available = true;
+#endif
+#ifdef OC_HAS_DLSS
+	input.dlssAvailable = true;
+#endif
+	input.fsrEnabled = cfg.FsrEnabled();
+	input.fsrNativeAA = cfg.FsrNativeAA();
+	input.dlssEnabled = cfg.DlssEnabled();
+	input.dlaaEnabled = cfg.DlaaEnabled();
+	input.aswEnabled = cfg.ASWEnabled();
+	input.renderScale = cfg.FsrRenderScale();
+	input.dlssPreset = cfg.DlssPreset();
+	input.mipBiasEnabled = cfg.MipBiasEnabled();
+	input.mipBiasMode = cfg.MipBias();
+	input.mipBiasOffset = cfg.MipBiasOffset();
+	input.fsr3MipBiasOffset = cfg.Fsr3MipBiasOffset();
+	input.dlssMipBiasOffset = cfg.DlssMipBiasOffset();
 
-	OCUExternalUpscalerMethod method = OCU_EXTERNAL_UPSCALER_NONE;
-	if (fsrTemporalActive)
-		method = cfg.FsrNativeAA() ? OCU_EXTERNAL_UPSCALER_FSR_NATIVE_AA : OCU_EXTERNAL_UPSCALER_FSR3;
-	else if (dlssTemporalActive)
-		method = (cfg.DlssPreset() == 4) ? OCU_EXTERNAL_UPSCALER_DLAA : OCU_EXTERNAL_UPSCALER_DLSS;
-	else if (dlaaPostActive)
-		method = OCU_EXTERNAL_UPSCALER_DLAA;
-
-	uint32_t flags = 0;
-	if (cfg.DlssEnabled())
-		flags |= OCU_EXTERNAL_UPSCALER_FLAG_DLSS;
-	if (cfg.FsrEnabled())
-		flags |= OCU_EXTERNAL_UPSCALER_FLAG_FSR3;
-	if (cfg.FsrNativeAA())
-		flags |= OCU_EXTERNAL_UPSCALER_FLAG_FSR_NATIVE_AA;
-	if (cfg.DlaaEnabled() || (cfg.DlssEnabled() && cfg.DlssPreset() == 4))
-		flags |= OCU_EXTERNAL_UPSCALER_FLAG_DLAA;
-	if (cfg.ASWEnabled())
-		flags |= OCU_EXTERNAL_UPSCALER_FLAG_ASW_ENABLED;
-
-	const float renderScale = active ? std::max(0.1f, std::min(1.0f, cfg.FsrRenderScale())) : 1.0f;
-	const float mipBias = active ? external_upscaler_mip_bias(renderScale) : 0.0f;
+	const auto state = ExternalUpscalerConfig::Resolve(input);
 	PublishExternalUpscalerState(
-	    active,
-	    method,
-	    renderScale,
-	    mipBias,
-	    -1.0f,
-	    static_cast<uint32_t>(cfg.DlssPreset()),
-	    flags);
+	    state.active,
+	    state.method,
+	    state.renderScale,
+	    state.mipBias,
+	    state.mipBiasOffset,
+	    state.dlssPreset,
+	    state.flags);
 }
 
 static int wini_parse(const wchar_t* filename, ini_handler handler, void* user)
