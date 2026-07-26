@@ -11,6 +11,7 @@
 #include "../Misc/xr_ext.h"
 
 #include <algorithm>
+#include <cstddef>
 #include <cerrno>
 #include <cctype>
 #include <cmath>
@@ -165,11 +166,19 @@ static bool ResolveSubmittedTextureRegion(
 #pragma pack(push, 1)
 struct OCRenderTargetBridge {
 	static constexpr uint32_t MAGIC = 0x56544F4D; // 'MOTV'
-	static constexpr uint32_t VERSION = 1;
+	static constexpr uint32_t VERSION = 2;
 
 	uint32_t magic;
 	uint32_t version;
+	uint32_t byteSize;
+	uint32_t publishSequence; // Odd = resource writer active, even = stable
 	uint32_t status; // 0=not ready, 1=ready, 2=error
+	uint32_t resourceReaders; // Pins published COM pointers through reader AddRef
+	uint64_t resourceGeneration;
+	uint32_t mvWidth;
+	uint32_t mvHeight;
+	uint32_t depthWidth;
+	uint32_t depthHeight;
 
 	uint64_t mvTexture; // ID3D11Texture2D*
 	uint64_t mvSRV; // ID3D11ShaderResourceView*
@@ -256,6 +265,9 @@ struct OCRenderTargetBridge {
 	uint8_t  _padMenu[6];              // alignment
 };
 #pragma pack(pop)
+static_assert(sizeof(OCRenderTargetBridge) == 704);
+static_assert(offsetof(OCRenderTargetBridge, publishSequence) % alignof(uint32_t) == 0);
+static_assert(offsetof(OCRenderTargetBridge, resourceReaders) % alignof(uint32_t) == 0);
 
 static HANDLE s_hBridgeMap = nullptr;
 static OCRenderTargetBridge* s_pBridge = nullptr;
@@ -300,9 +312,11 @@ static void OpenRenderTargetBridge()
 		return;
 	}
 
-	// Validate
-	if (s_pBridge->magic != OCRenderTargetBridge::MAGIC || s_pBridge->version != OCRenderTargetBridge::VERSION) {
-		OOVR_LOG("RT Bridge: Invalid magic/version — wrong SKSE plugin version?");
+	// The header is immutable after creation; resource fields use the v2 publish protocol below.
+	if (s_pBridge->magic != OCRenderTargetBridge::MAGIC ||
+	    s_pBridge->version != OCRenderTargetBridge::VERSION ||
+	    s_pBridge->byteSize < sizeof(OCRenderTargetBridge)) {
+		OOVR_LOG("RT Bridge: Invalid magic/version/size — wrong SKSE plugin version?");
 		UnmapViewOfFile(s_pBridge);
 		s_pBridge = nullptr;
 		CloseHandle(s_hBridgeMap);
@@ -313,7 +327,170 @@ static void OpenRenderTargetBridge()
 	OOVR_LOG("RT Bridge: Connected to SKSE shared memory");
 }
 
+struct OCBridgeResourceSnapshot {
+	uint32_t status = 0;
+	uint64_t generation = 0;
+	uint32_t mvWidth = 0;
+	uint32_t mvHeight = 0;
+	uint32_t depthWidth = 0;
+	uint32_t depthHeight = 0;
+	ID3D11Texture2D* mvTexture = nullptr;
+	ID3D11ShaderResourceView* mvSRV = nullptr;
+	ID3D11UnorderedAccessView* mvUAV = nullptr;
+	ID3D11Texture2D* depthTexture = nullptr;
+	ID3D11ShaderResourceView* depthSRV = nullptr;
+	ID3D11Device* d3dDevice = nullptr;
+	ID3D11DeviceContext* d3dContext = nullptr;
+
+	OCBridgeResourceSnapshot() = default;
+	OCBridgeResourceSnapshot(const OCBridgeResourceSnapshot&) = delete;
+	OCBridgeResourceSnapshot& operator=(const OCBridgeResourceSnapshot&) = delete;
+
+	~OCBridgeResourceSnapshot()
+	{
+		Reset();
+	}
+
+	void Reset()
+	{
+		if (mvUAV)
+			mvUAV->Release();
+		if (mvSRV)
+			mvSRV->Release();
+		if (depthSRV)
+			depthSRV->Release();
+		if (mvTexture)
+			mvTexture->Release();
+		if (depthTexture)
+			depthTexture->Release();
+		if (d3dContext)
+			d3dContext->Release();
+		if (d3dDevice)
+			d3dDevice->Release();
+
+		status = 0;
+		generation = 0;
+		mvWidth = 0;
+		mvHeight = 0;
+		depthWidth = 0;
+		depthHeight = 0;
+		mvTexture = nullptr;
+		mvSRV = nullptr;
+		mvUAV = nullptr;
+		depthTexture = nullptr;
+		depthSRV = nullptr;
+		d3dDevice = nullptr;
+		d3dContext = nullptr;
+	}
+
+	bool Ready() const
+	{
+		return status == 1 &&
+		       mvTexture &&
+		       d3dDevice &&
+		       d3dContext &&
+		       mvWidth != 0 &&
+		       mvHeight != 0 &&
+		       (!depthTexture || (depthWidth != 0 && depthHeight != 0));
+	}
+};
+
+static thread_local const OCBridgeResourceSnapshot* s_scopedBridgeResourceSnapshot = nullptr;
+
+class ScopedBridgeResourceSnapshot
+{
+public:
+	explicit ScopedBridgeResourceSnapshot(const OCBridgeResourceSnapshot* snapshot) :
+		previous(s_scopedBridgeResourceSnapshot)
+	{
+		// Deliberately scope an empty snapshot after acquisition failure. Nested
+		// calls must not acquire a newer generation halfway through one eye submit.
+		s_scopedBridgeResourceSnapshot = snapshot;
+	}
+
+	~ScopedBridgeResourceSnapshot()
+	{
+		s_scopedBridgeResourceSnapshot = previous;
+	}
+
+	ScopedBridgeResourceSnapshot(const ScopedBridgeResourceSnapshot&) = delete;
+	ScopedBridgeResourceSnapshot& operator=(const ScopedBridgeResourceSnapshot&) = delete;
+
+private:
+	const OCBridgeResourceSnapshot* previous;
+};
+
+static uint32_t ReadBridgeAtomic(const uint32_t& value)
+{
+	auto* atomicValue = reinterpret_cast<volatile LONG*>(const_cast<uint32_t*>(&value));
+	return static_cast<uint32_t>(InterlockedCompareExchange(atomicValue, 0, 0));
+}
+
+template <class T>
+static T* RetainBridgeSnapshotResource(uint64_t address)
+{
+	auto* resource = reinterpret_cast<T*>(static_cast<uintptr_t>(address));
+	if (resource)
+		resource->AddRef();
+	return resource;
+}
+
+static bool AcquireBridgeResourceSnapshot(OCBridgeResourceSnapshot& snapshot)
+{
+	snapshot.Reset();
+	OpenRenderTargetBridge();
+	if (!s_pBridge)
+		return false;
+
+	for (uint32_t attempt = 0; attempt < 8; ++attempt) {
+		const uint32_t beforeSequence = ReadBridgeAtomic(s_pBridge->publishSequence);
+		if ((beforeSequence & 1u) != 0) {
+			SwitchToThread();
+			continue;
+		}
+
+		InterlockedIncrement(reinterpret_cast<volatile LONG*>(&s_pBridge->resourceReaders));
+		MemoryBarrier();
+		const uint32_t pinnedSequence = ReadBridgeAtomic(s_pBridge->publishSequence);
+		if (pinnedSequence != beforeSequence || (pinnedSequence & 1u) != 0) {
+			InterlockedDecrement(reinterpret_cast<volatile LONG*>(&s_pBridge->resourceReaders));
+			continue;
+		}
+
+		// The writer cannot replace or release this generation until resourceReaders
+		// returns to zero, so AddRef is safe even if publication starts concurrently.
+		snapshot.status = s_pBridge->status;
+		snapshot.generation = s_pBridge->resourceGeneration;
+		snapshot.mvWidth = s_pBridge->mvWidth;
+		snapshot.mvHeight = s_pBridge->mvHeight;
+		snapshot.depthWidth = s_pBridge->depthWidth;
+		snapshot.depthHeight = s_pBridge->depthHeight;
+		snapshot.mvTexture = RetainBridgeSnapshotResource<ID3D11Texture2D>(s_pBridge->mvTexture);
+		snapshot.mvSRV = RetainBridgeSnapshotResource<ID3D11ShaderResourceView>(s_pBridge->mvSRV);
+		snapshot.mvUAV = RetainBridgeSnapshotResource<ID3D11UnorderedAccessView>(s_pBridge->mvUAV);
+		snapshot.depthTexture = RetainBridgeSnapshotResource<ID3D11Texture2D>(s_pBridge->depthTexture);
+		snapshot.depthSRV = RetainBridgeSnapshotResource<ID3D11ShaderResourceView>(s_pBridge->depthSRV);
+		snapshot.d3dDevice = RetainBridgeSnapshotResource<ID3D11Device>(s_pBridge->d3dDevice);
+		snapshot.d3dContext = RetainBridgeSnapshotResource<ID3D11DeviceContext>(s_pBridge->d3dContext);
+		MemoryBarrier();
+		InterlockedDecrement(reinterpret_cast<volatile LONG*>(&s_pBridge->resourceReaders));
+		return true;
+	}
+
+	return false;
+}
+
 // OCU ASW — PC-side Asynchronous SpaceWarp (global g_aswProvider in ASWProvider.h)
+
+static const OCBridgeResourceSnapshot& ReuseOrAcquireBridgeResourceSnapshot(
+    OCBridgeResourceSnapshot& localSnapshot)
+{
+	if (s_scopedBridgeResourceSnapshot)
+		return *s_scopedBridgeResourceSnapshot;
+
+	AcquireBridgeResourceSnapshot(localSnapshot);
+	return localSnapshot;
+}
 
 #if defined(OC_HAS_FSR3) || defined(OC_HAS_DLSS)
 #ifdef OC_HAS_FSR3
@@ -325,6 +502,7 @@ static bool s_fsr3FirstDispatch = true;
 static float s_fsr3RenderJitterX = 0.0f; // Jitter that was applied to current frame's rendering
 static float s_fsr3RenderJitterY = 0.0f;
 static uint8_t s_temporalJitterSubmittedEyeMask = 0;
+static uint8_t s_bridgeTemporalResetEyeMask = 0;
 static uint32_t s_fsr3ViewportW = 0; // FSR3 output viewport (for crop when swapchain > output)
 static uint32_t s_fsr3ViewportH = 0;
 
@@ -798,10 +976,13 @@ static void STDMETHODCALLTYPE Hook_DrawIndexedInstanced_OC(ID3D11DeviceContext* 
 
 static void InstallOMSetDSSHook()
 {
-	if (s_omSetDSSHooked || !s_pBridge || !s_pBridge->d3dContext)
+	OCBridgeResourceSnapshot bridgeResources;
+	const auto& activeBridgeResources = ReuseOrAcquireBridgeResourceSnapshot(bridgeResources);
+	if (s_omSetDSSHooked ||
+	    !activeBridgeResources.Ready())
 		return;
 
-	auto* ctx = reinterpret_cast<ID3D11DeviceContext*>(static_cast<uintptr_t>(s_pBridge->d3dContext));
+	auto* ctx = activeBridgeResources.d3dContext;
 	auto vtable = *reinterpret_cast<void***>(ctx);
 
 	MH_STATUS st = MH_Initialize();
@@ -841,9 +1022,14 @@ static void STDMETHODCALLTYPE Hook_OMSetRenderTargets(
     ID3D11DeviceContext* ctx, UINT numViews, ID3D11RenderTargetView* const* ppRTVs, ID3D11DepthStencilView* pDSV)
 {
 	// Check if the DSV being bound is the FP DS or the main DS
-	if (s_pBridge && s_pBridge->depthTexture && s_pBridge->status == 1
-	    && !s_pBridge->isMainMenu && !s_pBridge->isLoadingScreen) {
-		ID3D11Texture2D* mainDS = reinterpret_cast<ID3D11Texture2D*>(s_pBridge->depthTexture);
+	OCBridgeResourceSnapshot bridgeResources;
+	const auto& activeBridgeResources = ReuseOrAcquireBridgeResourceSnapshot(bridgeResources);
+	if (s_pBridge &&
+	    !s_pBridge->isMainMenu &&
+	    !s_pBridge->isLoadingScreen &&
+	    activeBridgeResources.Ready() &&
+	    activeBridgeResources.depthTexture) {
+		ID3D11Texture2D* mainDS = activeBridgeResources.depthTexture;
 		ID3D11Texture2D* dsvTex = nullptr;
 
 		if (pDSV) {
@@ -1570,8 +1756,12 @@ static ID3D11ShaderResourceView* GetOrCreateDepthSRV(ID3D11Device* device, ID3D1
 		OOVR_LOGF("DepthExtract: CreateSRV(fmt=%u on depth fmt=%u) failed (hr=0x%08X) — trying bridge SRV",
 		    srvFmt, depthFmt, hr);
 		// Fall back: use the SKSE bridge's pre-created depthSRV
-		if (s_pBridge && s_pBridge->depthSRV) {
-			s_depthBridgeSRV = reinterpret_cast<ID3D11ShaderResourceView*>(s_pBridge->depthSRV);
+		OCBridgeResourceSnapshot bridgeResources;
+		const auto& activeBridgeResources = ReuseOrAcquireBridgeResourceSnapshot(bridgeResources);
+		if (activeBridgeResources.Ready() &&
+		    activeBridgeResources.depthTexture == depthTex &&
+		    activeBridgeResources.depthSRV) {
+			s_depthBridgeSRV = activeBridgeResources.depthSRV;
 			s_depthBridgeSRV->AddRef();
 			s_depthBridgeSRVTex = depthTex;
 			OOVR_LOG("DepthExtract: Using bridge depthSRV as fallback");
@@ -4001,6 +4191,13 @@ void DX11Compositor::CheckCreateSwapChain(const vr::Texture_t* texture, const vr
 
 	D3D11_TEXTURE2D_DESC srcDesc;
 	src->GetDesc(&srcDesc);
+#ifdef OC_HAS_FSR3
+	OCBridgeResourceSnapshot localBridgeResources;
+	const auto& bridgeResources =
+	    ReuseOrAcquireBridgeResourceSnapshot(localBridgeResources);
+	ScopedBridgeResourceSnapshot bridgeResourceScope(&bridgeResources);
+	const bool bridgeResourcesReady = bridgeResources.Ready();
+#endif
 
 	if (bounds) {
 		if (std::fabs(bounds->uMax - bounds->uMin) > 0.1)
@@ -4021,7 +4218,7 @@ void DX11Compositor::CheckCreateSwapChain(const vr::Texture_t* texture, const vr
 	// FSR 3 can handle stereo-combined textures (bounds present); FSR 1 cannot
 	if (fsrActive && bounds) {
 		fsrActive = s_fsr3Upscaler && s_fsr3Upscaler->IsReady()
-		    && s_pBridge && s_pBridge->status == 1 && s_pBridge->mvTexture
+		    && bridgeResourcesReady && bridgeResources.mvTexture
 		    && oovr_global_configuration.MotionVectorsEnabled();
 	}
 #else
@@ -4495,6 +4692,14 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 		return;
 	}
 
+#if defined(OC_HAS_FSR3) || defined(OC_HAS_DLSS)
+	OCBridgeResourceSnapshot localBridgeResources;
+	const auto& bridgeResources =
+	    ReuseOrAcquireBridgeResourceSnapshot(localBridgeResources);
+	ScopedBridgeResourceSnapshot bridgeResourceScope(&bridgeResources);
+	const bool bridgeResourcesReady = bridgeResources.Ready();
+#endif
+
 	CheckCreateSwapChain(texture, bounds, false);
 
 	// Update cached game texture SRV (Skyrim VR submits the same texture every frame)
@@ -4554,9 +4759,9 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 		    && Fsr3TemporalRequested()
 		    && !isOverlay) {
 			const bool upscalerReady = s_fsr3Upscaler && s_fsr3Upscaler->IsReady();
-			const bool bridgeReady = s_pBridge && s_pBridge->status == 1;
-			const bool hasMV = bridgeReady && s_pBridge->mvTexture;
-			const bool mvValid = hasMV && ValidateBridgeTexture(reinterpret_cast<void*>(s_pBridge->mvTexture), "MV");
+			const bool bridgeReady = bridgeResourcesReady;
+			const bool hasMV = bridgeReady && bridgeResources.mvTexture;
+			const bool mvValid = hasMV && ValidateBridgeTexture(bridgeResources.mvTexture, "MV");
 			const bool motionVectorsEnabled = oovr_global_configuration.MotionVectorsEnabled();
 			const bool swapchainReady = !swapchain_rtvs.empty();
 			const bool wouldEnterFsr3 = upscalerReady && bridgeReady && hasMV && mvValid
@@ -4637,8 +4842,8 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 	// ── FSR 3 temporal upscaling path (DX12 interop) ──
 	// Takes priority over FSR 1 when the SKSE bridge provides motion vectors + depth.
 	else if (s_fsr3Upscaler && s_fsr3Upscaler->IsReady()
-	    && s_pBridge && s_pBridge->status == 1 && s_pBridge->mvTexture
-	    && ValidateBridgeTexture(reinterpret_cast<void*>(s_pBridge->mvTexture), "MV")
+	    && bridgeResourcesReady && bridgeResources.mvTexture
+	    && ValidateBridgeTexture(bridgeResources.mvTexture, "MV")
 	    && oovr_global_configuration.MotionVectorsEnabled()
 	    && oovr_global_configuration.FsrEnabled()
 	    && Fsr3TemporalRequested()
@@ -4732,10 +4937,8 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 			// game's renderer — they can become stale if the renderer resets (e.g., load
 			// screen) between the VirtualQuery check above and the GetDesc call here.
 			// SafeGetTextureDesc catches use-after-free and we fall back to a direct copy.
-			auto* mvTex = reinterpret_cast<ID3D11Texture2D*>(s_pBridge->mvTexture);
-			auto* depthTex = s_pBridge->depthTexture
-			    ? reinterpret_cast<ID3D11Texture2D*>(s_pBridge->depthTexture)
-			    : nullptr;
+			auto* mvTex = bridgeResources.mvTexture;
+			auto* depthTex = bridgeResources.depthTexture;
 			if (depthTex && !ValidateBridgeTexture(depthTex, "Depth"))
 				depthTex = nullptr;
 
@@ -5005,7 +5208,7 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 								}
 							}
 
-							auto* gameMVSRV = s_pBridge->mvSRV ? reinterpret_cast<ID3D11ShaderResourceView*>(s_pBridge->mvSRV) : nullptr;
+							auto* gameMVSRV = bridgeResources.mvSRV;
 							int gameMVOffX = 0;
 							if (gameMVSRV && (mvDesc.Width >= perEyeRenderW * 2 - 4) && eye == 1)
 								gameMVOffX = (int)(mvDesc.Width / 2);
@@ -5161,7 +5364,10 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 				fsr3Params.cameraFar = g_fsr3CameraFar;
 				fsr3Params.cameraFovY = s_fsr3CameraFovY;
 				fsr3Params.sharpness = oovr_global_configuration.Fsr3Sharpness();
+				const uint8_t bridgeResetEyeBit =
+				    static_cast<uint8_t>(1u << s_currentEyeIdx);
 				fsr3Params.reset = s_fsr3FirstDispatch
+				    || (s_bridgeTemporalResetEyeMask & bridgeResetEyeBit) != 0
 				    || (s_pBridge && (s_pBridge->isMainMenu || s_pBridge->isLoadingScreen || s_pBridge->isMenuOpen));
 				// Camera MVs are generated in unjittered UV space, matching the DLSS path.
 				// FSR3 still receives the jitter offset separately; context-level jitter
@@ -5374,6 +5580,8 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 
 				bool fsr3Ok = s_fsr3Upscaler->Dispatch(s_currentEyeIdx, context, fsr3Params);
 				s_fsr3FirstDispatch = false;
+				if (fsr3Ok)
+					s_bridgeTemporalResetEyeMask &= static_cast<uint8_t>(~bridgeResetEyeBit);
 
 				// Sync both eyes: if left eye wasn't ready (warmup), force right eye to use
 				// fallback too, so both eyes transition to FSR3 output on the same stereo frame.
@@ -5464,8 +5672,8 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 #ifdef OC_HAS_DLSS
 	// ── DLSS 4 Super Resolution path (native DX11 NGX, no DX12 interop) ──
 	else if (s_dlssUpscaler && s_dlssUpscaler->IsReady()
-	    && s_pBridge && s_pBridge->status == 1 && s_pBridge->mvTexture
-	    && ValidateBridgeTexture(reinterpret_cast<void*>(s_pBridge->mvTexture), "MV")
+	    && bridgeResourcesReady && bridgeResources.mvTexture
+	    && ValidateBridgeTexture(bridgeResources.mvTexture, "MV")
 	    && oovr_global_configuration.DlssEnabled()
 	    && (oovr_global_configuration.FsrRenderScale() < 0.99f || oovr_global_configuration.DlssPreset() == 4)
 	    && !isOverlay && !swapchain_rtvs.empty()) {
@@ -5510,10 +5718,8 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 		}
 
 		// MV + depth from SKSE bridge
-		auto* dlssMVTex = reinterpret_cast<ID3D11Texture2D*>(s_pBridge->mvTexture);
-		auto* dlssDepthTex = s_pBridge->depthTexture
-		    ? reinterpret_cast<ID3D11Texture2D*>(s_pBridge->depthTexture)
-		    : nullptr;
+		auto* dlssMVTex = bridgeResources.mvTexture;
+		auto* dlssDepthTex = bridgeResources.depthTexture;
 		if (dlssDepthTex && !ValidateBridgeTexture(dlssDepthTex, "Depth"))
 			dlssDepthTex = nullptr;
 
@@ -5700,7 +5906,7 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 							}
 						}
 
-						auto* gameMVSRV = s_pBridge->mvSRV ? reinterpret_cast<ID3D11ShaderResourceView*>(s_pBridge->mvSRV) : nullptr;
+						auto* gameMVSRV = bridgeResources.mvSRV;
 						int gameMVOffX = 0;
 						if (gameMVSRV && (dlssMVDesc.Width >= dlssRenderW * 2 - 4) && eye == 1)
 							gameMVOffX = (int)(dlssMVDesc.Width / 2);
@@ -5847,12 +6053,17 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 			dlssParams.sharpness = oovr_global_configuration.DlssSharpness();
 			dlssParams.biasMask = dlssBiasMaskTex;
 			dlssParams.biasMaskSourceRegion = dlssBiasMaskRegionPtr;
+			const uint8_t bridgeResetEyeBit =
+			    static_cast<uint8_t>(1u << s_currentEyeIdx);
 			dlssParams.reset = s_fsr3FirstDispatch
+			    || (s_bridgeTemporalResetEyeMask & bridgeResetEyeBit) != 0
 			    || (s_pBridge && (s_pBridge->isMainMenu || s_pBridge->isLoadingScreen || s_pBridge->isMenuOpen));
 			dlssParams.debugMode = 0;
 			s_fsr3FirstDispatch = false;
 
 			bool dlssOk = s_dlssUpscaler->Dispatch(s_currentEyeIdx, context, dlssParams);
+			if (dlssOk)
+				s_bridgeTemporalResetEyeMask &= static_cast<uint8_t>(~bridgeResetEyeBit);
 
 			// Eye sync: ensure both eyes transition to DLSS output on the same stereo frame
 			{
@@ -6364,6 +6575,38 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 	// Set current eye index for FSR radius matching (inner Invoke reads this)
 	s_currentEyeIdx = (eye == XruEyeLeft) ? 0 : 1;
 
+	OCBridgeResourceSnapshot bridgeResources;
+	const bool bridgeSnapshotValid = AcquireBridgeResourceSnapshot(bridgeResources);
+	ScopedBridgeResourceSnapshot bridgeResourceScope(&bridgeResources);
+	const bool bridgeResourcesReady = bridgeSnapshotValid && bridgeResources.Ready();
+	static uint64_t s_activeBridgeGeneration = 0;
+	if (bridgeSnapshotValid &&
+	    bridgeResources.generation != 0 &&
+	    bridgeResources.generation != s_activeBridgeGeneration) {
+		s_activeBridgeGeneration = bridgeResources.generation;
+#if defined(OC_HAS_FSR3) || defined(OC_HAS_DLSS)
+		// A recreated MV/depth set is a temporal discontinuity. Neither eye may
+		// carry history or jitter bookkeeping across this generation boundary.
+		s_fsr3FirstDispatch = true;
+		s_temporalJitterSubmittedEyeMask = 0;
+		s_bridgeTemporalResetEyeMask = 0x3u;
+#endif
+		if (g_aswProvider) {
+			// Issue 2's stereo cache tracks successful eye copies. Invalidate its
+			// in-progress pair so generations can never be mixed.
+			g_aswProvider->InvalidateCachedFrame();
+		}
+		OOVR_LOGF(
+		    "RT Bridge v2: generation=%llu status=%u MV=%ux%u depth=%ux%u "
+		    "(temporal history reset)",
+		    static_cast<unsigned long long>(bridgeResources.generation),
+		    bridgeResources.status,
+		    bridgeResources.mvWidth,
+		    bridgeResources.mvHeight,
+		    bridgeResources.depthWidth,
+		    bridgeResources.depthHeight);
+	}
+
 #ifdef OC_HAS_FSR3
 	// Capture per-eye pose and FOV for camera MV computation (inner Invoke reads these)
 	s_fsr3EyePose[s_currentEyeIdx] = layer.pose;
@@ -6377,7 +6620,7 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 		OpenRenderTargetBridge();
 
 		// Lazy-init the FSR 3 upscaler (DX12 device + FidelityFX DLLs)
-		if (!s_fsr3Upscaler && s_pBridge && s_pBridge->status == 1) {
+		if (!s_fsr3Upscaler && bridgeResourcesReady) {
 			s_fsr3Upscaler = new Fsr3Upscaler();
 			if (!s_fsr3Upscaler->Initialize(device)) {
 				OOVR_LOG("FSR3: Initialization failed — falling back to FSR 1");
@@ -6447,7 +6690,7 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 	    && (oovr_global_configuration.FsrRenderScale() < 0.99f || oovr_global_configuration.DlssPreset() == 4)) {
 		static bool s_dlssInitFailed = false; // Prevent retrying every frame (~300ms per attempt)
 		OpenRenderTargetBridge();
-		if (!s_dlssUpscaler && !s_dlssInitFailed && s_pBridge && s_pBridge->status == 1) {
+		if (!s_dlssUpscaler && !s_dlssInitFailed && bridgeResourcesReady) {
 			s_dlssUpscaler = new DlssUpscaler();
 			if (!s_dlssUpscaler->Initialize(device)) {
 				OOVR_LOG("DLSS: Initialization failed — falling back to FSR 1. Check log for details.");
@@ -6462,7 +6705,7 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 	// OCU ASW: lazy-init (needs bridge MV for texture dimensions + eye resolution)
 	if (oovr_global_configuration.ASWEnabled()) {
 		OpenRenderTargetBridge();
-		if (!g_aswProvider && s_pBridge && s_pBridge->status == 1) {
+		if (!g_aswProvider && bridgeResourcesReady) {
 			// Get eye resolution — use display-res when upscaler is active so
 			// ASW staging textures match the upscaled output resolution.
 			auto* src = (ID3D11Texture2D*)texture->handle;
@@ -6574,17 +6817,31 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 	// Accumulate per-eye regions; submit both eyes when eye 1 arrives.
 	layer.next = nullptr;
 	if (g_spaceWarpProvider && g_spaceWarpProvider->IsReady()
-	    && s_pBridge && s_pBridge->status == 1 && s_pBridge->mvTexture
+	    && bridgeResourcesReady && bridgeResources.mvTexture
 	    && !s_pBridge->isMainMenu && !s_pBridge->isLoadingScreen
-	    && ValidateBridgeTexture(reinterpret_cast<void*>(s_pBridge->mvTexture), "SpaceWarp-MV")) {
+	    && ValidateBridgeTexture(bridgeResources.mvTexture, "SpaceWarp-MV")) {
 
 		static D3D11_BOX s_swMvRegions[2] = {};
 		static D3D11_BOX s_swDepthRegions[2] = {};
-		static ID3D11Texture2D* s_swMvTex = nullptr;
-		static ID3D11Texture2D* s_swDepthTex = nullptr;
+		static uint64_t s_swGeneration = 0;
+		static uint8_t s_swEyeMask = 0;
+		static bool s_swDepthValid[2] = {};
 
 		int eyeIdx = s_currentEyeIdx;
-		auto* mvTex = reinterpret_cast<ID3D11Texture2D*>(s_pBridge->mvTexture);
+		if (s_swGeneration != bridgeResources.generation) {
+			s_swGeneration = bridgeResources.generation;
+			s_swEyeMask = 0;
+			s_swDepthValid[0] = false;
+			s_swDepthValid[1] = false;
+		}
+		if (eyeIdx == 0) {
+			// A failed left-eye validation must not leave the previous stereo
+			// pair's mask/depth state available to a later right eye.
+			s_swEyeMask = 0;
+			s_swDepthValid[0] = false;
+			s_swDepthValid[1] = false;
+		}
+		auto* mvTex = bridgeResources.mvTexture;
 		D3D11_TEXTURE2D_DESC mvDesc;
 		if (SafeGetTextureDesc(mvTex, &mvDesc)) {
 			uint32_t mvEyeW = mvDesc.Width / 2;
@@ -6595,16 +6852,14 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 			s_swMvRegions[eyeIdx].bottom = mvDesc.Height;
 			s_swMvRegions[eyeIdx].front = 0;
 			s_swMvRegions[eyeIdx].back = 1;
-			s_swMvTex = mvTex;
+			s_swEyeMask |= static_cast<uint8_t>(1u << eyeIdx);
 
 			// Extract depth to R32F (same as custom ASW path)
-			auto* depthTex = s_pBridge->depthTexture
-			    ? reinterpret_cast<ID3D11Texture2D*>(s_pBridge->depthTexture)
-			    : nullptr;
+			auto* depthTex = bridgeResources.depthTexture;
 			if (depthTex && !ValidateBridgeTexture(depthTex, "SpaceWarp-Depth"))
 				depthTex = nullptr;
 
-			s_swDepthTex = nullptr;
+			s_swDepthValid[eyeIdx] = false;
 			if (depthTex) {
 				D3D11_TEXTURE2D_DESC depthDesc;
 				if (SafeGetTextureDesc(depthTex, &depthDesc)) {
@@ -6613,7 +6868,7 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 						    depthDesc.Format, depthDesc.Width, depthDesc.Height);
 						if (depthSRV && ExtractDepthToR32F(context, depthSRV,
 						        depthDesc.Width, depthDesc.Height)) {
-							s_swDepthTex = s_depthR32F;
+							s_swDepthValid[eyeIdx] = true;
 							uint32_t depthEyeW = depthDesc.Width / 2;
 							s_swDepthRegions[eyeIdx].left = eyeIdx * depthEyeW;
 							s_swDepthRegions[eyeIdx].right = s_swDepthRegions[eyeIdx].left + depthEyeW;
@@ -6627,11 +6882,14 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 			}
 
 			// Submit both eyes when right eye arrives
-			if (eyeIdx == 1 && s_swMvTex) {
+			if (eyeIdx == 1 && s_swEyeMask == 0x3) {
+				auto* depthForSubmit =
+				    (s_swDepthValid[0] && s_swDepthValid[1]) ? s_depthR32F : nullptr;
 				bool ok = g_spaceWarpProvider->SubmitFrame(context,
-				    s_swMvTex, s_swMvRegions,
-				    s_swDepthTex, s_swDepthRegions,
+				    mvTex, s_swMvRegions,
+				    depthForSubmit, s_swDepthRegions,
 				    g_fsr3CameraNear, g_fsr3CameraFar);
+				s_swEyeMask = 0;
 				static int s_log = 0;
 				if (s_log++ < 5)
 					OOVR_LOGF("SpaceWarp: SubmitFrame result=%d near=%.2f far=%.1f",
@@ -6651,15 +6909,13 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 	// and warping menu content causes visual glitches on save load.
 	if (g_aswProvider && g_aswProvider->IsReady()
 	    && g_aswProvider->IsInjectionWanted() // auto-native: no injection → skip cache copies
-	    && s_pBridge && s_pBridge->status == 1 && s_pBridge->mvTexture
+	    && bridgeResourcesReady && bridgeResources.mvTexture
 	    && !s_pBridge->isMainMenu && !s_pBridge->isLoadingScreen
-	    && ValidateBridgeTexture(reinterpret_cast<void*>(s_pBridge->mvTexture), "ASW-MV")) {
+	    && ValidateBridgeTexture(bridgeResources.mvTexture, "ASW-MV")) {
 		const bool aswExperimental = oovr_global_configuration.aswExperimentalMode;
 
-		auto* mvTex = reinterpret_cast<ID3D11Texture2D*>(s_pBridge->mvTexture);
-		auto* depthTex = s_pBridge->depthTexture
-		    ? reinterpret_cast<ID3D11Texture2D*>(s_pBridge->depthTexture)
-		    : nullptr;
+		auto* mvTex = bridgeResources.mvTexture;
+		auto* depthTex = bridgeResources.depthTexture;
 		if (depthTex && !ValidateBridgeTexture(depthTex, "ASW-Depth"))
 			depthTex = nullptr;
 

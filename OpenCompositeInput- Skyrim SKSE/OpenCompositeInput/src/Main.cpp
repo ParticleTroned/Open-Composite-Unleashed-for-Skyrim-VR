@@ -42,8 +42,10 @@ namespace RE { class GASGlobalContext; } // Forward decl needed by GFxMovieRoot.
 #include <SKSE/SKSE.h>
 #include <algorithm> // laser cursor pump: std::clamp
 #include <chrono> // gesture concentration-spell burst pacing
+#include <cstddef>
 #include <fstream>
 #include <thread> // gesture concentration-spell burst
+#include <utility>
 
 #include <spdlog/sinks/basic_file_sink.h>
 #include <set>
@@ -124,11 +126,19 @@ struct OCMenuTransform {
 #pragma pack(push, 1)
 struct OCRenderTargetBridge {
 	static constexpr uint32_t MAGIC = 0x56544F4D; // 'MOTV'
-	static constexpr uint32_t VERSION = 1;
+	static constexpr uint32_t VERSION = 2;
 
 	uint32_t magic;
 	uint32_t version;
+	uint32_t byteSize;
+	uint32_t publishSequence; // Odd = resource writer active, even = stable
 	uint32_t status;        // 0=not ready, 1=ready, 2=error
+	uint32_t resourceReaders; // Pins the published COM pointers while a reader AddRefs
+	uint64_t resourceGeneration;
+	uint32_t mvWidth;
+	uint32_t mvHeight;
+	uint32_t depthWidth;
+	uint32_t depthHeight;
 
 	// Motion vector render target
 	uint64_t mvTexture;     // ID3D11Texture2D*
@@ -222,6 +232,9 @@ struct OCRenderTargetBridge {
 	uint8_t  _padMenu[6];              // alignment
 };
 #pragma pack(pop)
+static_assert(sizeof(OCRenderTargetBridge) == 704);
+static_assert(offsetof(OCRenderTargetBridge, publishSequence) % alignof(uint32_t) == 0);
+static_assert(offsetof(OCRenderTargetBridge, resourceReaders) % alignof(uint32_t) == 0);
 
 namespace
 {
@@ -242,6 +255,241 @@ namespace
 	// =========================================================================
 	HANDLE                g_hBridgeMapFile = nullptr;
 	OCRenderTargetBridge* g_pBridge = nullptr;
+
+	template <class T>
+	T* RetainBridgeResource(T* a_resource)
+	{
+		if (a_resource)
+			a_resource->AddRef();
+		return a_resource;
+	}
+
+	struct BridgeResourceRefs
+	{
+		ID3D11Texture2D* mvTexture = nullptr;
+		ID3D11ShaderResourceView* mvSRV = nullptr;
+		ID3D11UnorderedAccessView* mvUAV = nullptr;
+		ID3D11Texture2D* depthTexture = nullptr;
+		ID3D11ShaderResourceView* depthSRV = nullptr;
+		ID3D11Device* d3dDevice = nullptr;
+		ID3D11DeviceContext* d3dContext = nullptr;
+		uint32_t mvWidth = 0;
+		uint32_t mvHeight = 0;
+		uint32_t depthWidth = 0;
+		uint32_t depthHeight = 0;
+
+		BridgeResourceRefs() = default;
+		BridgeResourceRefs(const BridgeResourceRefs&) = delete;
+		BridgeResourceRefs& operator=(const BridgeResourceRefs&) = delete;
+
+		BridgeResourceRefs(BridgeResourceRefs&& a_other) noexcept
+		{
+			Swap(a_other);
+		}
+
+		BridgeResourceRefs& operator=(BridgeResourceRefs&& a_other) noexcept
+		{
+			if (this != &a_other) {
+				Reset();
+				Swap(a_other);
+			}
+			return *this;
+		}
+
+		~BridgeResourceRefs()
+		{
+			Reset();
+		}
+
+		void Reset()
+		{
+			if (mvUAV)
+				mvUAV->Release();
+			if (mvSRV)
+				mvSRV->Release();
+			if (depthSRV)
+				depthSRV->Release();
+			if (mvTexture)
+				mvTexture->Release();
+			if (depthTexture)
+				depthTexture->Release();
+			if (d3dContext)
+				d3dContext->Release();
+			if (d3dDevice)
+				d3dDevice->Release();
+
+			mvTexture = nullptr;
+			mvSRV = nullptr;
+			mvUAV = nullptr;
+			depthTexture = nullptr;
+			depthSRV = nullptr;
+			d3dDevice = nullptr;
+			d3dContext = nullptr;
+			mvWidth = 0;
+			mvHeight = 0;
+			depthWidth = 0;
+			depthHeight = 0;
+		}
+
+		void Swap(BridgeResourceRefs& a_other) noexcept
+		{
+			std::swap(mvTexture, a_other.mvTexture);
+			std::swap(mvSRV, a_other.mvSRV);
+			std::swap(mvUAV, a_other.mvUAV);
+			std::swap(depthTexture, a_other.depthTexture);
+			std::swap(depthSRV, a_other.depthSRV);
+			std::swap(d3dDevice, a_other.d3dDevice);
+			std::swap(d3dContext, a_other.d3dContext);
+			std::swap(mvWidth, a_other.mvWidth);
+			std::swap(mvHeight, a_other.mvHeight);
+			std::swap(depthWidth, a_other.depthWidth);
+			std::swap(depthHeight, a_other.depthHeight);
+		}
+
+		BridgeResourceRefs RetainCopy() const
+		{
+			BridgeResourceRefs copy;
+			copy.mvTexture = RetainBridgeResource(mvTexture);
+			copy.mvSRV = RetainBridgeResource(mvSRV);
+			copy.mvUAV = RetainBridgeResource(mvUAV);
+			copy.depthTexture = RetainBridgeResource(depthTexture);
+			copy.depthSRV = RetainBridgeResource(depthSRV);
+			copy.d3dDevice = RetainBridgeResource(d3dDevice);
+			copy.d3dContext = RetainBridgeResource(d3dContext);
+			copy.mvWidth = mvWidth;
+			copy.mvHeight = mvHeight;
+			copy.depthWidth = depthWidth;
+			copy.depthHeight = depthHeight;
+			return copy;
+		}
+
+		bool SameResources(const BridgeResourceRefs& a_other) const
+		{
+			return mvTexture == a_other.mvTexture &&
+			       mvSRV == a_other.mvSRV &&
+			       mvUAV == a_other.mvUAV &&
+			       depthTexture == a_other.depthTexture &&
+			       depthSRV == a_other.depthSRV &&
+			       d3dDevice == a_other.d3dDevice &&
+			       d3dContext == a_other.d3dContext &&
+			       mvWidth == a_other.mvWidth &&
+			       mvHeight == a_other.mvHeight &&
+			       depthWidth == a_other.depthWidth &&
+			       depthHeight == a_other.depthHeight;
+		}
+	};
+
+	std::mutex g_bridgeResourceMutex;
+	BridgeResourceRefs g_bridgeResources;
+	uint64_t g_bridgeResourceGeneration = 0;
+
+	uint32_t ReadBridgeAtomic(const uint32_t& a_value)
+	{
+		auto* value = reinterpret_cast<volatile LONG*>(const_cast<uint32_t*>(&a_value));
+		return static_cast<uint32_t>(InterlockedCompareExchange(value, 0, 0));
+	}
+
+	void BeginBridgeResourcePublish()
+	{
+		auto* sequence = reinterpret_cast<volatile LONG*>(&g_pBridge->publishSequence);
+		LONG writingSequence = InterlockedIncrement(sequence);
+		if ((writingSequence & 1) == 0)
+			InterlockedIncrement(sequence);
+
+		// Readers increment before copying and AddRefing. Once the sequence is odd,
+		// no new reader can enter, so zero means the previous COM set can be retired.
+		while (ReadBridgeAtomic(g_pBridge->resourceReaders) != 0)
+			SwitchToThread();
+		MemoryBarrier();
+	}
+
+	void EndBridgeResourcePublish()
+	{
+		MemoryBarrier();
+		InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_pBridge->publishSequence));
+	}
+
+	bool PublishBridgeResources(BridgeResourceRefs&& a_resources, uint32_t a_status)
+	{
+		if (!g_pBridge)
+			return false;
+
+		std::lock_guard<std::mutex> lock(g_bridgeResourceMutex);
+		if (g_pBridge->status == a_status && g_bridgeResources.SameResources(a_resources))
+			return false;
+
+		BridgeResourceRefs previousResources = std::move(g_bridgeResources);
+		g_bridgeResources = std::move(a_resources);
+
+		BeginBridgeResourcePublish();
+		g_pBridge->status = a_status;
+		g_pBridge->resourceGeneration = ++g_bridgeResourceGeneration;
+		g_pBridge->mvWidth = g_bridgeResources.mvWidth;
+		g_pBridge->mvHeight = g_bridgeResources.mvHeight;
+		g_pBridge->depthWidth = g_bridgeResources.depthWidth;
+		g_pBridge->depthHeight = g_bridgeResources.depthHeight;
+		g_pBridge->mvTexture = reinterpret_cast<uint64_t>(g_bridgeResources.mvTexture);
+		g_pBridge->mvSRV = reinterpret_cast<uint64_t>(g_bridgeResources.mvSRV);
+		g_pBridge->mvUAV = reinterpret_cast<uint64_t>(g_bridgeResources.mvUAV);
+		g_pBridge->depthTexture = reinterpret_cast<uint64_t>(g_bridgeResources.depthTexture);
+		g_pBridge->depthSRV = reinterpret_cast<uint64_t>(g_bridgeResources.depthSRV);
+		g_pBridge->d3dDevice = reinterpret_cast<uint64_t>(g_bridgeResources.d3dDevice);
+		g_pBridge->d3dContext = reinterpret_cast<uint64_t>(g_bridgeResources.d3dContext);
+		EndBridgeResourcePublish();
+
+		// previousResources releases only after the v2 snapshot is stable and all
+		// readers that could have seen the old raw addresses hold their own COM refs.
+		return true;
+	}
+
+	BridgeResourceRefs AcquirePublishedBridgeResources()
+	{
+		std::lock_guard<std::mutex> lock(g_bridgeResourceMutex);
+		return g_bridgeResources.RetainCopy();
+	}
+
+	bool CaptureBridgeResources(BridgeResourceRefs& o_resources)
+	{
+		auto* renderer = RE::BSGraphics::Renderer::GetSingleton();
+		if (!renderer)
+			return false;
+
+		auto& runtimeData = renderer->GetRuntimeData();
+		auto& mvRT = runtimeData.renderTargets[RE::RENDER_TARGET::kMOTION_VECTOR];
+		auto* d3dDevice = reinterpret_cast<ID3D11Device*>(runtimeData.forwarder);
+		auto* d3dContext = reinterpret_cast<ID3D11DeviceContext*>(runtimeData.context);
+		if (!mvRT.texture || !d3dDevice || !d3dContext)
+			return false;
+
+		BridgeResourceRefs resources;
+		resources.mvTexture = RetainBridgeResource(mvRT.texture);
+		resources.mvSRV = RetainBridgeResource(mvRT.SRV);
+		resources.mvUAV = RetainBridgeResource(mvRT.UAV);
+		resources.d3dDevice = RetainBridgeResource(d3dDevice);
+		resources.d3dContext = RetainBridgeResource(d3dContext);
+
+		D3D11_TEXTURE2D_DESC mvDesc{};
+		resources.mvTexture->GetDesc(&mvDesc);
+		resources.mvWidth = mvDesc.Width;
+		resources.mvHeight = mvDesc.Height;
+
+		auto& depthData = renderer->GetDepthStencilData();
+		auto& mainDepth = depthData.depthStencils[RE::RENDER_TARGET_DEPTHSTENCIL::kMAIN];
+		if (mainDepth.texture) {
+			resources.depthTexture = RetainBridgeResource(mainDepth.texture);
+			resources.depthSRV = RetainBridgeResource(mainDepth.depthSRV);
+
+			D3D11_TEXTURE2D_DESC depthDesc{};
+			resources.depthTexture->GetDesc(&depthDesc);
+			resources.depthWidth = depthDesc.Width;
+			resources.depthHeight = depthDesc.Height;
+		}
+
+		o_resources = std::move(resources);
+		return true;
+	}
+
+	void RefreshBridgeRenderTargets();
 
 	void CreateSharedMemory()
 	{
@@ -297,60 +545,11 @@ namespace
 		memset(g_pBridge, 0, sizeof(OCRenderTargetBridge));
 		g_pBridge->magic = OCRenderTargetBridge::MAGIC;
 		g_pBridge->version = OCRenderTargetBridge::VERSION;
+		g_pBridge->byteSize = sizeof(OCRenderTargetBridge);
 		g_pBridge->status = 0; // Not ready yet
 
-		// Access renderer to get render target pointers
-		auto renderer = RE::BSGraphics::Renderer::GetSingleton();
-		if (!renderer) {
-			SKSE::log::error("RT Bridge: Renderer singleton not available");
-			g_pBridge->status = 2;
-			return;
-		}
-
-		auto& runtimeData = renderer->GetRuntimeData();
-
-		// Motion vector render target (enum index 7 = kMOTION_VECTOR)
-		auto& mvRT = runtimeData.renderTargets[RE::RENDER_TARGET::kMOTION_VECTOR];
-		if (!mvRT.texture) {
-			SKSE::log::error("RT Bridge: kMOTION_VECTOR texture is null");
-			g_pBridge->status = 2;
-			return;
-		}
-
-		g_pBridge->mvTexture = reinterpret_cast<uint64_t>(mvRT.texture);
-		g_pBridge->mvSRV     = reinterpret_cast<uint64_t>(mvRT.SRV);
-		g_pBridge->mvUAV     = reinterpret_cast<uint64_t>(mvRT.UAV);
-
-		SKSE::log::info("RT Bridge: kMOTION_VECTOR texture={:p} SRV={:p} UAV={:p}",
-			static_cast<void*>(mvRT.texture),
-			static_cast<void*>(mvRT.SRV),
-			static_cast<void*>(mvRT.UAV));
-
-		// Depth buffer
-		auto& depthData = renderer->GetDepthStencilData();
-		auto& mainDepth = depthData.depthStencils[RE::RENDER_TARGET_DEPTHSTENCIL::kMAIN];
-		if (!mainDepth.texture) {
-			SKSE::log::warn("RT Bridge: kMAIN depth texture is null (MV still available)");
-		} else {
-			g_pBridge->depthTexture = reinterpret_cast<uint64_t>(mainDepth.texture);
-			g_pBridge->depthSRV     = reinterpret_cast<uint64_t>(mainDepth.depthSRV);
-
-			SKSE::log::info("RT Bridge: Depth texture={:p} SRV={:p}",
-				static_cast<void*>(mainDepth.texture),
-				static_cast<void*>(mainDepth.depthSRV));
-		}
-
-		// D3D11 device and context (for receiver to validate same device)
-		g_pBridge->d3dDevice  = reinterpret_cast<uint64_t>(runtimeData.forwarder);
-		g_pBridge->d3dContext = reinterpret_cast<uint64_t>(runtimeData.context);
-
-		SKSE::log::info("RT Bridge: Device={:p} Context={:p}",
-			reinterpret_cast<void*>(runtimeData.forwarder),
-			reinterpret_cast<void*>(runtimeData.context));
-
-		// Mark as ready
-		g_pBridge->status = 1;
-		SKSE::log::info("RT Bridge: Ready — shared memory Local\\OpenCompositeRenderTargets ({} bytes)",
+		RefreshBridgeRenderTargets();
+		SKSE::log::info("RT Bridge v2: shared memory Local\\OpenCompositeRenderTargets ({} bytes)",
 			sizeof(OCRenderTargetBridge));
 	}
 
@@ -361,32 +560,34 @@ namespace
 	// flashing, potential use-after-free). Called on the game thread ~1/sec.
 	void RefreshBridgeRenderTargets()
 	{
-		if (!g_pBridge || g_pBridge->status != 1)
+		if (!g_pBridge)
 			return;
 
-		auto renderer = RE::BSGraphics::Renderer::GetSingleton();
-		if (!renderer)
+		BridgeResourceRefs resources;
+		if (!CaptureBridgeResources(resources)) {
+			BridgeResourceRefs unavailable;
+			if (PublishBridgeResources(std::move(unavailable), 2)) {
+				SKSE::log::warn("RT Bridge v2: resources unavailable; publication paused and refresh will retry");
+			}
 			return;
-
-		auto& runtimeData = renderer->GetRuntimeData();
-		auto& mvRT = runtimeData.renderTargets[RE::RENDER_TARGET::kMOTION_VECTOR];
-		uint64_t mvTexNow = reinterpret_cast<uint64_t>(mvRT.texture);
-		if (mvTexNow && mvTexNow != g_pBridge->mvTexture) {
-			g_pBridge->mvTexture = mvTexNow;
-			g_pBridge->mvSRV = reinterpret_cast<uint64_t>(mvRT.SRV);
-			g_pBridge->mvUAV = reinterpret_cast<uint64_t>(mvRT.UAV);
-			SKSE::log::info("RT Bridge: kMOTION_VECTOR RECREATED — refreshed to {:p}",
-				static_cast<void*>(mvRT.texture));
 		}
 
-		auto& depthData = renderer->GetDepthStencilData();
-		auto& mainDepth = depthData.depthStencils[RE::RENDER_TARGET_DEPTHSTENCIL::kMAIN];
-		uint64_t depthTexNow = reinterpret_cast<uint64_t>(mainDepth.texture);
-		if (depthTexNow && depthTexNow != g_pBridge->depthTexture) {
-			g_pBridge->depthTexture = depthTexNow;
-			g_pBridge->depthSRV = reinterpret_cast<uint64_t>(mainDepth.depthSRV);
-			SKSE::log::info("RT Bridge: kMAIN depth RECREATED — refreshed to {:p}",
-				static_cast<void*>(mainDepth.texture));
+		auto* mvTexture = resources.mvTexture;
+		auto* depthTexture = resources.depthTexture;
+		const uint32_t mvWidth = resources.mvWidth;
+		const uint32_t mvHeight = resources.mvHeight;
+		const uint32_t depthWidth = resources.depthWidth;
+		const uint32_t depthHeight = resources.depthHeight;
+		if (PublishBridgeResources(std::move(resources), 1)) {
+			SKSE::log::info(
+			    "RT Bridge v2: generation {} ready — MV={:p} {}x{}, depth={:p} {}x{}",
+			    g_pBridge->resourceGeneration,
+			    static_cast<void*>(mvTexture),
+			    mvWidth,
+			    mvHeight,
+			    static_cast<void*>(depthTexture),
+			    depthWidth,
+			    depthHeight);
 		}
 	}
 
@@ -1859,11 +2060,14 @@ namespace
 
 	void CreateStencilStagingTexture()
 	{
-		if (!g_pBridge || !g_pBridge->depthTexture || !g_pBridge->d3dDevice)
+		auto bridgeResources = AcquirePublishedBridgeResources();
+		if (!g_pBridge || !bridgeResources.depthTexture || !bridgeResources.d3dDevice)
 			return;
 
-		auto* device = reinterpret_cast<ID3D11Device*>(g_pBridge->d3dDevice);
-		g_mainDepthTex = reinterpret_cast<ID3D11Texture2D*>(g_pBridge->depthTexture);
+		auto* device = bridgeResources.d3dDevice;
+		if (g_mainDepthTex)
+			g_mainDepthTex->Release();
+		g_mainDepthTex = RetainBridgeResource(bridgeResources.depthTexture);
 
 		D3D11_TEXTURE2D_DESC depthDesc;
 		g_mainDepthTex->GetDesc(&depthDesc);
@@ -1892,12 +2096,13 @@ namespace
 
 	void InstallClearDSVHook()
 	{
-		if (!g_pBridge || !g_pBridge->d3dDevice)
+		auto bridgeResources = AcquirePublishedBridgeResources();
+		if (!g_pBridge || !bridgeResources.d3dDevice)
 			return;
 
 		// Get the immediate context from the device — runtimeData.context may be
 		// a different object than what the game actually renders through.
-		auto* device = reinterpret_cast<ID3D11Device*>(g_pBridge->d3dDevice);
+		auto* device = bridgeResources.d3dDevice;
 		ID3D11DeviceContext* ctx = nullptr;
 		device->GetImmediateContext(&ctx);
 		if (!ctx) {
@@ -1906,7 +2111,7 @@ namespace
 		}
 
 		SKSE::log::info("StencilCapture: ImmediateContext={:p} bridge.context={:p}",
-		    static_cast<void*>(ctx), reinterpret_cast<void*>(g_pBridge->d3dContext));
+		    static_cast<void*>(ctx), static_cast<void*>(bridgeResources.d3dContext));
 
 		// ID3D11DeviceContext vtable slot 53 = ClearDepthStencilView
 		auto vtable = *reinterpret_cast<uintptr_t**>(ctx);
@@ -1976,6 +2181,11 @@ namespace
 			SKSE::log::error("DIAG: Renderer singleton is NULL");
 			return;
 		}
+		auto bridgeResources = AcquirePublishedBridgeResources();
+		if (!bridgeResources.d3dDevice) {
+			SKSE::log::error("DIAG: RT bridge device is unavailable");
+			return;
+		}
 		SKSE::log::info("DIAG: Renderer at {:p}", (void*)renderer);
 
 		// 2. Get depth stencil data array
@@ -1991,7 +2201,7 @@ namespace
 			(void*)d3dCtx, g_setupGeomCtx ? (void*)g_setupGeomCtx : nullptr);
 
 		// 4. Create small STAGING texture for readback tests (4x4 R24G8)
-		auto* device = reinterpret_cast<ID3D11Device*>(g_pBridge->d3dDevice);
+		auto* device = bridgeResources.d3dDevice;
 		ID3D11Texture2D* stagingDS = nullptr;
 		{
 			D3D11_TEXTURE2D_DESC td = {};
@@ -2114,12 +2324,12 @@ namespace
 		// 7. Compare game's main DS texture with our bridge DS
 		{
 			auto& mainDS = dsArray[0]; // kMAIN
-			auto* bridgeDS = reinterpret_cast<ID3D11Texture2D*>(g_pBridge->depthTexture);
+			auto* bridgeDS = bridgeResources.depthTexture;
 			SKSE::log::info("DIAG: Game kMAIN DS tex={:p}, bridge depthTexture={:p}, SAME={}",
 				(void*)mainDS.texture, (void*)bridgeDS, mainDS.texture == bridgeDS);
 
 			// Check if game's depthSRV is same as bridge depthSRV
-			auto* bridgeSRV = reinterpret_cast<ID3D11ShaderResourceView*>(g_pBridge->depthSRV);
+			auto* bridgeSRV = bridgeResources.depthSRV;
 			SKSE::log::info("DIAG: Game kMAIN depthSRV={:p}, bridge depthSRV={:p}, SAME={}",
 				(void*)mainDS.depthSRV, (void*)bridgeSRV, mainDS.depthSRV == bridgeSRV);
 		}
@@ -2596,7 +2806,7 @@ uint main() : SV_Target { return 255; }
 		// Parent chain walk to identify FP geometry
 		bool isFP = false;
 		uintptr_t geometry = 0;
-		if (g_pBridge && g_pBridge->status == 1) {
+		if (g_pBridge) {
 			uintptr_t fpRoot = static_cast<uintptr_t>(g_pBridge->playerFirstPersonRootPtr);
 			if (fpRoot) {
 				uintptr_t passAddr = reinterpret_cast<uintptr_t>(renderPass);
@@ -2778,10 +2988,15 @@ uint main() : SV_Target { return 255; }
 				// Dump all VS constant buffers (slots 0-14)
 				ID3D11Buffer* vsCBs[15] = {};
 				g_setupGeomCtx->VSGetConstantBuffers(0, 15, vsCBs);
-				auto* device = reinterpret_cast<ID3D11Device*>(g_pBridge->d3dDevice);
+				ID3D11Device* device = nullptr;
+				g_setupGeomCtx->GetDevice(&device);
 
 				for (int slot = 0; slot < 15; slot++) {
 					if (!vsCBs[slot]) continue;
+					if (!device) {
+						vsCBs[slot]->Release();
+						continue;
+					}
 					D3D11_BUFFER_DESC cbDesc = {};
 					vsCBs[slot]->GetDesc(&cbDesc);
 
@@ -2829,6 +3044,8 @@ uint main() : SV_Target { return 255; }
 					}
 					vsCBs[slot]->Release();
 				}
+				if (device)
+					device->Release();
 			}
 
 			// Re-draw FP geometry to mask texture.
@@ -3003,10 +3220,12 @@ uint main() : SV_Target { return 255; }
 
 	void InstallSetupGeometryHook()
 	{
-		if (!g_pBridge || !g_pBridge->d3dDevice) return;
+		auto bridgeResources = AcquirePublishedBridgeResources();
+		if (!g_pBridge || !bridgeResources.d3dDevice || !bridgeResources.depthTexture)
+			return;
 
 		// Get immediate context (same approach as InstallClearDSVHook)
-		auto* device = reinterpret_cast<ID3D11Device*>(g_pBridge->d3dDevice);
+		auto* device = bridgeResources.d3dDevice;
 		device->GetImmediateContext(&g_setupGeomCtx);
 		if (!g_setupGeomCtx) {
 			SKSE::log::error("FPStencil: GetImmediateContext returned null");
@@ -3053,9 +3272,8 @@ uint main() : SV_Target { return 255; }
 
 		// Create re-draw FP mask infrastructure
 		{
-			auto* device = reinterpret_cast<ID3D11Device*>(g_pBridge->d3dDevice);
 			D3D11_TEXTURE2D_DESC depthDesc;
-			g_mainDepthTex->GetDesc(&depthDesc);
+			bridgeResources.depthTexture->GetDesc(&depthDesc);
 			g_fpMaskW = depthDesc.Width;
 			g_fpMaskH = depthDesc.Height;
 
