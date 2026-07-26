@@ -37,7 +37,7 @@ cbuffer WarpParams : register(b0) {
     float debugTint;            // >0.5 = red-tint warp frames (aswDebugMode=10)
     float2 depthResolution;     // depth grid size — may be smaller than resolution
                                 // when an external render-scale mod is active
-    float2 pad0;
+    float2 sourceFlip;          // x is reserved; y preserves reversed-V OpenVR bounds
 };
 
 // Linearize depth from reversed-Z buffer value
@@ -57,8 +57,12 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
     // 1. Read depth from old frame (approximate — depth changes slowly between frames).
     // Depth may live at a different (smaller) grid than the color/output when an
     // external render-scale mod is active, so index it through UV, not tid.xy.
+    // The bridge depth target is raster-aligned with the submitted game color.
+    // Canonicalize it for warp sampling; the raw XR depth layer is disabled
+    // for flipped pairs because that swapchain is not transformed here.
+    float2 depthUV = lerp(uv, 1.0 - uv, sourceFlip);
     int2 dmax = int2((int)depthResolution.x - 1, (int)depthResolution.y - 1);
-    int2 dpix = clamp((int2)(uv * depthResolution), int2(0,0), dmax);
+    int2 dpix = clamp((int2)(depthUV * depthResolution), int2(0,0), dmax);
     float d = depthTex[dpix];
     float linearDepth = LinearizeDepth(d, nearZ, farZ);
 
@@ -102,7 +106,8 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
         sourceUV = uv;
     sourceUV = saturate(sourceUV);
 
-    float4 color = prevColor.SampleLevel(linearClamp, sourceUV, 0);
+    float2 colorUV = lerp(sourceUV, 1.0 - sourceUV, sourceFlip);
+    float4 color = prevColor.SampleLevel(linearClamp, colorUV, 0);
 
     // Debug: tint warp frames red so they're distinguishable from real frames
     if (debugTint > 0.5) {
@@ -277,7 +282,7 @@ bool ASWProvider::CreateComputeShader(ID3D11Device* device)
 	// Constant buffer
 	D3D11_BUFFER_DESC cbDesc = {};
 	cbDesc.ByteWidth = sizeof(WarpConstants);
-	// Pad to 16-byte alignment (WarpConstants is 112 bytes, already aligned)
+	// Pad to 16-byte alignment (WarpConstants is 128 bytes, already aligned)
 	cbDesc.ByteWidth = (cbDesc.ByteWidth + 15) & ~15;
 	cbDesc.Usage = D3D11_USAGE_DYNAMIC;
 	cbDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
@@ -579,6 +584,7 @@ static bool SafeBridgeCopy(ID3D11DeviceContext* ctx,
 
 void ASWProvider::CacheFrame(int eye, ID3D11DeviceContext* ctx,
     ID3D11Texture2D* colorTex, const D3D11_BOX* colorRegion,
+    bool sourceFlipV,
     ID3D11Texture2D* mvTex, const D3D11_BOX* mvRegion,
     ID3D11Texture2D* depthTex, const D3D11_BOX* depthRegion,
     const XrPosef& eyePose, const XrFovf& eyeFov,
@@ -639,6 +645,7 @@ void ASWProvider::CacheFrame(int eye, ID3D11DeviceContext* ctx,
 
 	m_cachedPose[eye] = eyePose;
 	m_cachedFov[eye] = eyeFov;
+	m_cachedSourceFlipV[eye] = sourceFlipV;
 	m_cachedNear = nearZ;
 	m_cachedFar = farZ;
 
@@ -717,6 +724,8 @@ bool ASWProvider::WarpFrame(int eye, ID3D11DeviceContext* ctx,
 	cb.debugTint = (oovr_global_configuration.ASWDebugMode() == 10) ? 1.0f : 0.0f;
 	cb.depthResolution[0] = (float)(m_depthWidth ? m_depthWidth : m_eyeWidth);
 	cb.depthResolution[1] = (float)(m_depthHeight ? m_depthHeight : m_eyeHeight);
+	cb.sourceFlip[0] = 0.0f;
+	cb.sourceFlip[1] = m_cachedSourceFlipV[eye] ? 1.0f : 0.0f;
 
 	// Update constant buffer
 	D3D11_MAPPED_SUBRESOURCE mapped;
@@ -797,7 +806,7 @@ bool ASWProvider::SubmitWarpedOutput(ID3D11DeviceContext* ctx)
 	// Submit depth swapchain (if available). Skipped when the depth cache runs
 	// at a different resolution than the eye (external render scale) — the
 	// swapchain copy needs matching sizes and stale depth is worse than none.
-	if (m_depthSwapchain != XR_NULL_HANDLE && m_depthLayerValid) {
+	if (m_depthSwapchain != XR_NULL_HANDLE && DepthLayerValid()) {
 		XrSwapchainImageAcquireInfo depthAcquire = { XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
 		uint32_t depthIdx = 0;
 		XrResult depthRes = xrAcquireSwapchainImage(m_depthSwapchain, &depthAcquire, &depthIdx);

@@ -112,6 +112,53 @@ static bool CompileOrLoadCached(
 
 // (Controller poses now routed through ASWProvider::SetControllerPos/GetControllerPos)
 
+// Resolve the submitted eye region from OpenVR's normalized texture bounds.
+// A non-null bounds pointer only means that a region was supplied; it does not
+// imply that the texture contains both eyes side-by-side. In particular,
+// external submit-time upscalers may provide one full texture per eye together
+// with explicit { 0, 0, 1, 1 } bounds.
+static bool ResolveSubmittedTextureRegion(
+    const D3D11_TEXTURE2D_DESC& desc,
+    const vr::VRTextureBounds_t* bounds,
+    D3D11_BOX& region)
+{
+	if (desc.Width == 0 || desc.Height == 0)
+		return false;
+
+	float minU = 0.0f;
+	float maxU = 1.0f;
+	float minV = 0.0f;
+	float maxV = 1.0f;
+	if (bounds) {
+		if (!std::isfinite(bounds->uMin) || !std::isfinite(bounds->uMax)
+		    || !std::isfinite(bounds->vMin) || !std::isfinite(bounds->vMax)) {
+			return false;
+		}
+
+		minU = std::clamp(std::min(bounds->uMin, bounds->uMax), 0.0f, 1.0f);
+		maxU = std::clamp(std::max(bounds->uMin, bounds->uMax), 0.0f, 1.0f);
+		minV = std::clamp(std::min(bounds->vMin, bounds->vMax), 0.0f, 1.0f);
+		maxV = std::clamp(std::max(bounds->vMin, bounds->vMax), 0.0f, 1.0f);
+	}
+
+	// Match the normal submit copy's truncation policy. Computing the span
+	// independently from the offset also keeps both halves of an odd-width
+	// side-by-side texture the same size.
+	auto toPixel = [](float normalized, uint32_t dimension) {
+		return static_cast<uint32_t>(normalized * static_cast<float>(dimension));
+	};
+
+	const uint32_t regionWidth = toPixel(maxU - minU, desc.Width);
+	const uint32_t regionHeight = toPixel(maxV - minV, desc.Height);
+	region.left = toPixel(minU, desc.Width);
+	region.top = toPixel(minV, desc.Height);
+	region.right = std::min(desc.Width, region.left + regionWidth);
+	region.bottom = std::min(desc.Height, region.top + regionHeight);
+	region.front = 0;
+	region.back = 1;
+	return region.right > region.left && region.bottom > region.top;
+}
+
 // ============================================================================
 // SKSE Render Target Bridge — shared memory for motion vectors + depth
 // ============================================================================
@@ -6420,9 +6467,11 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 			// ASW staging textures match the upscaled output resolution.
 			auto* src = (ID3D11Texture2D*)texture->handle;
 			D3D11_TEXTURE2D_DESC srcDesc;
-			if (SafeGetTextureDesc(src, &srcDesc)) {
-				uint32_t renderEyeW = ptrBounds ? srcDesc.Width / 2 : srcDesc.Width;
-				uint32_t renderEyeH = srcDesc.Height;
+			D3D11_BOX submittedRegion = {};
+			if (SafeGetTextureDesc(src, &srcDesc)
+			    && ResolveSubmittedTextureRegion(srcDesc, ptrBounds, submittedRegion)) {
+				uint32_t renderEyeW = submittedRegion.right - submittedRegion.left;
+				uint32_t renderEyeH = submittedRegion.bottom - submittedRegion.top;
 				uint32_t aswEyeW = renderEyeW;
 				uint32_t aswEyeH = renderEyeH;
 
@@ -6627,8 +6676,10 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 		// render targets within ~1s).
 		if (mvDescOk) {
 			D3D11_TEXTURE2D_DESC gameDesc;
-			if (SafeGetTextureDesc((ID3D11Texture2D*)texture->handle, &gameDesc)) {
-				uint32_t gameEyeW = ptrBounds ? gameDesc.Width / 2 : gameDesc.Width;
+			D3D11_BOX submittedRegion = {};
+			if (SafeGetTextureDesc((ID3D11Texture2D*)texture->handle, &gameDesc)
+			    && ResolveSubmittedTextureRegion(gameDesc, ptrBounds, submittedRegion)) {
+				uint32_t gameEyeW = submittedRegion.right - submittedRegion.left;
 				uint32_t mvEyeWChk = mvDesc.Width / 2;
 				bool mismatch = (mvEyeWChk + 16 < gameEyeW) || (gameEyeW + 16 < mvEyeWChk);
 				if (mismatch != s_aswExternalScaleMismatch) {
@@ -6664,6 +6715,7 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 			ID3D11Texture2D* colorSrc = (ID3D11Texture2D*)texture->handle;
 			D3D11_TEXTURE2D_DESC colorDesc;
 			D3D11_BOX colorRegion = {};
+			const bool colorFlipV = ptrBounds && ptrBounds->vMin > ptrBounds->vMax;
 
 #ifdef OC_HAS_FSR3
 			// Warp-source selection, gated on motion vectors:
@@ -6675,6 +6727,7 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 			//    (warp-of-warp) that only occurs when FSR3 temporal MVs are active.
 			if (!g_aswProvider->HasWarpUpscaleCallback()
 			    && !oovr_global_configuration.MotionVectorsEnabled()
+			    && !colorFlipV
 			    && s_fsr3Upscaler && s_fsr3Upscaler->IsReady()
 			    && oovr_global_configuration.FsrEnabled()) {
 				ID3D11Texture2D* fsr3Out = s_fsr3Upscaler->GetOutputDX11(eyeIdx);
@@ -6687,13 +6740,7 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 			}
 #endif
 			if (colorRegion.right == 0 && SafeGetTextureDesc(colorSrc, &colorDesc)) {
-				uint32_t colorEyeW = ptrBounds ? colorDesc.Width / 2 : colorDesc.Width;
-				colorRegion.left = ptrBounds ? eyeIdx * colorEyeW : 0;
-				colorRegion.right = colorRegion.left + colorEyeW;
-				colorRegion.top = 0;
-				colorRegion.bottom = colorDesc.Height;
-				colorRegion.front = 0;
-				colorRegion.back = 1;
+				ResolveSubmittedTextureRegion(colorDesc, ptrBounds, colorRegion);
 			}
 
 			// Extract bridge depth (R24G8_TYPELESS) to R32F via compute shader.
@@ -6903,18 +6950,21 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 				static int s_aswNoDepthLog = 0;
 				if (s_aswNoDepthLog++ < 5)
 					OOVR_LOGF("ASW: skipping cache for eye %d because depth extraction is unavailable", eyeIdx);
+			} else if (colorRegion.right <= colorRegion.left || colorRegion.bottom <= colorRegion.top) {
+				static int s_aswBadColorRegionLog = 0;
+				if (s_aswBadColorRegionLog++ < 5)
+					OOVR_LOGF("ASW: skipping cache for eye %d because submitted texture bounds are invalid", eyeIdx);
 			} else {
 				g_aswProvider->CacheFrame(eyeIdx, context,
 				    colorSrc, &colorRegion,
+				    colorFlipV,
 				    mvTex, &mvRegion,
 				    aswDepthSrc, &depthRegion,
 				    layer.pose, layer.fov,
 				    g_fsr3CameraNear, g_fsr3CameraFar);
-			}
 
-			// Store predicted display time for this cache slot (for MV extrapolation timing).
-			// After CacheFrame eye 1, buildSlot has advanced — use publishedSlot instead.
-			if (aswDepthSrc) {
+				// Store predicted display time for this cache slot (for MV extrapolation timing).
+				// After CacheFrame eye 1, buildSlot has advanced — use publishedSlot instead.
 				// For eye 0: buildSlot hasn't advanced yet. For eye 1: just published.
 				int dtSlot = (eyeIdx == 1)
 				    ? g_aswProvider->GetPublishedSlot()
@@ -7078,29 +7128,32 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 			auto* src = (ID3D11Texture2D*)texture->handle;
 			D3D11_TEXTURE2D_DESC srcDesc;
 			src->GetDesc(&srcDesc);
-			uint32_t renderW = ptrBounds ? srcDesc.Width / 2 : srcDesc.Width;
-			uint32_t displayW = xr_main_view(XruEyeLeft).recommendedImageRectWidth;
+			D3D11_BOX submittedRegion = {};
+			if (ResolveSubmittedTextureRegion(srcDesc, ptrBounds, submittedRegion)) {
+				uint32_t renderW = submittedRegion.right - submittedRegion.left;
+				uint32_t displayW = xr_main_view(XruEyeLeft).recommendedImageRectWidth;
 
 #ifdef OC_HAS_FSR3
-		g_fsr3JitterPhaseCount = Fsr3Upscaler::GetJitterPhaseCount(renderW, displayW);
-		Fsr3Upscaler::GetJitterOffset(&g_fsr3JitterX, &g_fsr3JitterY,
-		    g_fsr3FrameIndex, g_fsr3JitterPhaseCount);
+				g_fsr3JitterPhaseCount = Fsr3Upscaler::GetJitterPhaseCount(renderW, displayW);
+				Fsr3Upscaler::GetJitterOffset(&g_fsr3JitterX, &g_fsr3JitterY,
+				    g_fsr3FrameIndex, g_fsr3JitterPhaseCount);
 #else
-		// DLSS-only build: use DlssUpscaler's jitter helpers
-		g_fsr3JitterPhaseCount = DlssUpscaler::GetJitterPhaseCount(renderW, displayW);
-		DlssUpscaler::GetJitterOffset(&g_fsr3JitterX, &g_fsr3JitterY,
-		    g_fsr3FrameIndex, g_fsr3JitterPhaseCount);
+				// DLSS-only build: use DlssUpscaler's jitter helpers
+				g_fsr3JitterPhaseCount = DlssUpscaler::GetJitterPhaseCount(renderW, displayW);
+				DlssUpscaler::GetJitterOffset(&g_fsr3JitterX, &g_fsr3JitterY,
+				    g_fsr3FrameIndex, g_fsr3JitterPhaseCount);
 #endif
-		// Apply jitter scale — lower values reduce temporal instability in VR.
-		// DLSS has its own jitter scale config to allow independent tuning.
-		float jScale = oovr_global_configuration.Fsr3JitterScale();
+				// Apply jitter scale — lower values reduce temporal instability in VR.
+				// DLSS has its own jitter scale config to allow independent tuning.
+				float jScale = oovr_global_configuration.Fsr3JitterScale();
 #ifdef OC_HAS_DLSS
-		if (oovr_global_configuration.DlssEnabled())
-			jScale = oovr_global_configuration.DlssJitterScale();
+				if (oovr_global_configuration.DlssEnabled())
+					jScale = oovr_global_configuration.DlssJitterScale();
 #endif
-		g_fsr3JitterX *= jScale;
-		g_fsr3JitterY *= jScale;
-		g_fsr3FrameIndex++;
+				g_fsr3JitterX *= jScale;
+				g_fsr3JitterY *= jScale;
+				g_fsr3FrameIndex++;
+			}
 			s_temporalJitterSubmittedEyeMask = 0;
 		}
 	}
@@ -7123,8 +7176,11 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 			auto* src = (ID3D11Texture2D*)texture->handle;
 			D3D11_TEXTURE2D_DESC desc;
 			src->GetDesc(&desc);
-			s_vrsEyeW = ptrBounds ? desc.Width / 2 : desc.Width;
-			s_vrsEyeH = desc.Height;
+			D3D11_BOX submittedRegion = {};
+			if (ResolveSubmittedTextureRegion(desc, ptrBounds, submittedRegion)) {
+				s_vrsEyeW = submittedRegion.right - submittedRegion.left;
+				s_vrsEyeH = submittedRegion.bottom - submittedRegion.top;
+			}
 		}
 
 		// After right eye (frame complete): update patterns for both eyes

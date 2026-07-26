@@ -38,6 +38,7 @@ public:
 	/// Call on each eye during the real frame's Invoke.
 	void CacheFrame(int eye, ID3D11DeviceContext* ctx,
 	    ID3D11Texture2D* colorTex, const D3D11_BOX* colorRegion,
+	    bool sourceFlipV,
 	    ID3D11Texture2D* mvTex, const D3D11_BOX* mvRegion,
 	    ID3D11Texture2D* depthTex, const D3D11_BOX* depthRegion,
 	    const XrPosef& eyePose, const XrFovf& eyeFov,
@@ -70,8 +71,12 @@ public:
 
 	/// False while the depth cache runs at a different resolution than the eye
 	/// (external render scale). The parallax warp still works (shader samples
-	/// depth by UV); only the XR depth layer must be skipped.
-	bool DepthLayerValid() const { return m_depthLayerValid; }
+	/// depth by UV), or when reversed submit bounds require shader-side depth
+	/// sampling that the unchanged XR depth swapchain cannot represent.
+	bool DepthLayerValid() const
+	{
+		return m_depthLayerValid && !m_cachedSourceFlipV[0] && !m_cachedSourceFlipV[1];
+	}
 
 	/// Get per-eye sub-image rect for the warped output (stereo-combined).
 	XrRect2Di GetOutputRect(int eye) const;
@@ -232,6 +237,7 @@ private:
 	// Cached pose/FOV/depth from real frame
 	XrPosef m_cachedPose[2] = {};
 	XrFovf m_cachedFov[2] = {};
+	bool m_cachedSourceFlipV[2] = {};
 	float m_cachedNear = 0.1f;
 	float m_cachedFar = 10000.0f;
 	bool m_hasCachedFrame = false;
@@ -247,6 +253,7 @@ private:
 		float nearFadeDepth;       // parallax fades to 0 below this depth (game units); 0 = disabled
 		float debugTint;           // >0.5 = red-tint warp frames (aswDebugMode=10)
 		float depthResolution[2];  // depth grid size (may differ from resolution under external render scale)
-		float pad0[2];
+		float sourceFlip[2];       // x is reserved; y=1 preserves reversed-V submit bounds
 	};
+	static_assert(sizeof(WarpConstants) == 128);
 };
