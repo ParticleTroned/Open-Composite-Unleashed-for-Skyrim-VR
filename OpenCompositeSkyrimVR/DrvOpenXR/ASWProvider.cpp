@@ -243,7 +243,7 @@ bool ASWProvider::Initialize(ID3D11Device* device, uint32_t eyeWidth, uint32_t e
 	}
 
 	m_ready = true;
-	m_hasCachedFrame = false;
+	InvalidateCachedFrame();
 	OOVR_LOGF("ASW: Initialized — %ux%u per eye, compute shader ready", eyeWidth, eyeHeight);
 	return true;
 }
@@ -394,7 +394,7 @@ bool ASWProvider::ResizeColorPath(uint32_t eyeW, uint32_t eyeH)
 	OOVR_LOGF("ASW: adaptive resize color path %ux%u -> %ux%u",
 	    m_eyeWidth, m_eyeHeight, eyeW, eyeH);
 
-	m_hasCachedFrame = false;
+	InvalidateCachedFrame();
 	ReleaseStagingTextures();
 
 	if (m_outputSwapchain != XR_NULL_HANDLE) {
@@ -436,7 +436,7 @@ bool ASWProvider::ResizeDepthCache(uint32_t w, uint32_t h)
 	OOVR_LOGF("ASW: adaptive resize depth cache %ux%u -> %ux%u",
 	    m_depthWidth, m_depthHeight, w, h);
 
-	m_hasCachedFrame = false;
+	InvalidateCachedFrame();
 	for (int i = 0; i < 2; i++) {
 		if (m_srvDepth[i]) { m_srvDepth[i]->Release(); m_srvDepth[i] = nullptr; }
 		if (m_cachedDepth[i]) { m_cachedDepth[i]->Release(); m_cachedDepth[i] = nullptr; }
@@ -582,7 +582,7 @@ static bool SafeBridgeCopy(ID3D11DeviceContext* ctx,
 	}
 }
 
-void ASWProvider::CacheFrame(int eye, ID3D11DeviceContext* ctx,
+bool ASWProvider::CacheFrame(int eye, ID3D11DeviceContext* ctx,
     ID3D11Texture2D* colorTex, const D3D11_BOX* colorRegion,
     bool sourceFlipV,
     ID3D11Texture2D* mvTex, const D3D11_BOX* mvRegion,
@@ -590,7 +590,34 @@ void ASWProvider::CacheFrame(int eye, ID3D11DeviceContext* ctx,
     const XrPosef& eyePose, const XrFovf& eyeFov,
     float nearZ, float farZ)
 {
-	if (!m_ready || eye < 0 || eye > 1) return;
+	auto failGeneration = [this]() {
+		InvalidateCachedFrame();
+		return false;
+	};
+
+	if (!m_ready || eye < 0 || eye > 1)
+		return failGeneration();
+
+	// A left-eye submit begins a new generation. The provider has a single
+	// stereo cache, so the previously published pair must stop being visible
+	// before either eye is overwritten.
+	if (eye == 0) {
+		InvalidateCachedFrame();
+	} else if (m_cacheBuildEyeMask != 0x1) {
+		// Never combine a right eye with a left eye from an older generation.
+		return failGeneration();
+	}
+
+	auto validRegion = [](const D3D11_BOX* region) {
+		return region
+		    && region->right > region->left
+		    && region->bottom > region->top
+		    && region->back > region->front;
+	};
+	if (!ctx || !colorTex || !depthTex
+	    || !validRegion(colorRegion) || !validRegion(depthRegion)) {
+		return failGeneration();
+	}
 
 	// ── Adaptive sizing ──
 	// External render-scale mods (Community Shaders VR) upscale the submitted
@@ -603,9 +630,9 @@ void ASWProvider::CacheFrame(int eye, ID3D11DeviceContext* ctx,
 		uint32_t ch = colorRegion->bottom - colorRegion->top;
 		if (cw && ch && (cw != m_eyeWidth || ch != m_eyeHeight)) {
 			if (eye != 0)
-				return; // resize only on eye 0 so the pair stays consistent
+				return failGeneration(); // resize only on eye 0 so the pair stays consistent
 			if (!ResizeColorPath(cw, ch))
-				return;
+				return failGeneration();
 		}
 	}
 	if (depthRegion) {
@@ -613,11 +640,14 @@ void ASWProvider::CacheFrame(int eye, ID3D11DeviceContext* ctx,
 		uint32_t dh = depthRegion->bottom - depthRegion->top;
 		if (dw && dh && (dw != m_depthWidth || dh != m_depthHeight)) {
 			if (eye != 0)
-				return;
+				return failGeneration();
 			if (!ResizeDepthCache(dw, dh))
-				return;
+				return failGeneration();
 		}
 	}
+	if (!m_cachedColor[eye] || !m_cachedDepth[eye])
+		return failGeneration();
+
 	// The XR depth layer needs depth at the eye size; the parallax warp does not.
 	m_depthLayerValid = (m_depthWidth == m_eyeWidth && m_depthHeight == m_eyeHeight);
 
@@ -626,7 +656,7 @@ void ASWProvider::CacheFrame(int eye, ID3D11DeviceContext* ctx,
 		if (!SafeBridgeCopy(ctx, m_cachedColor[eye], 0, 0, 0, 0,
 		    colorTex, 0, colorRegion)) {
 			OOVR_LOG("ASW: TOCTOU — color texture freed during copy");
-			return;
+			return failGeneration();
 		}
 	}
 
@@ -639,7 +669,7 @@ void ASWProvider::CacheFrame(int eye, ID3D11DeviceContext* ctx,
 		if (!SafeBridgeCopy(ctx, m_cachedDepth[eye], 0, 0, 0, 0,
 		    depthTex, 0, depthRegion)) {
 			OOVR_LOG("ASW: TOCTOU — depth texture freed during copy");
-			return;
+			return failGeneration();
 		}
 	}
 
@@ -649,13 +679,19 @@ void ASWProvider::CacheFrame(int eye, ID3D11DeviceContext* ctx,
 	m_cachedNear = nearZ;
 	m_cachedFar = farZ;
 
-	// Both eyes cached → ready for warping
+	m_cacheBuildEyeMask |= static_cast<uint8_t>(1u << eye);
+
+	// Publish only a complete left+right pair from this generation.
 	if (eye == 1) {
+		if (m_cacheBuildEyeMask != 0x3)
+			return failGeneration();
 		m_hasCachedFrame = true;
+		m_cacheBuildEyeMask = 0;
 		static int s = 0;
 		if (s++ < 3)
 			OOVR_LOGF("ASW: Frame cached — near=%.2f far=%.1f", nearZ, farZ);
 	}
+	return true;
 }
 
 bool ASWProvider::WarpFrame(int eye, ID3D11DeviceContext* ctx,
@@ -850,7 +886,7 @@ bool ASWProvider::SubmitWarpedOutput(ID3D11DeviceContext* ctx)
 void ASWProvider::Shutdown()
 {
 	m_ready = false;
-	m_hasCachedFrame = false;
+	InvalidateCachedFrame();
 
 	if (m_depthSwapchain != XR_NULL_HANDLE) {
 		xrDestroySwapchain(m_depthSwapchain);

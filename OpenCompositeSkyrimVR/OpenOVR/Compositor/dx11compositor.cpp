@@ -6946,25 +6946,30 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 			// Menu state — skip MV corrections when a menu is open
 			g_aswProvider->SetMenuOpen(s_pBridge->isMenuOpen != 0);
 
+			bool aswEyeCached = false;
 			if (!aswDepthSrc) {
+				g_aswProvider->InvalidateCachedFrame();
 				static int s_aswNoDepthLog = 0;
 				if (s_aswNoDepthLog++ < 5)
 					OOVR_LOGF("ASW: skipping cache for eye %d because depth extraction is unavailable", eyeIdx);
 			} else if (colorRegion.right <= colorRegion.left || colorRegion.bottom <= colorRegion.top) {
+				g_aswProvider->InvalidateCachedFrame();
 				static int s_aswBadColorRegionLog = 0;
 				if (s_aswBadColorRegionLog++ < 5)
 					OOVR_LOGF("ASW: skipping cache for eye %d because submitted texture bounds are invalid", eyeIdx);
 			} else {
-				g_aswProvider->CacheFrame(eyeIdx, context,
+				aswEyeCached = g_aswProvider->CacheFrame(eyeIdx, context,
 				    colorSrc, &colorRegion,
 				    colorFlipV,
 				    mvTex, &mvRegion,
 				    aswDepthSrc, &depthRegion,
 				    layer.pose, layer.fov,
 				    g_fsr3CameraNear, g_fsr3CameraFar);
+			}
 
-				// Store predicted display time for this cache slot (for MV extrapolation timing).
-				// After CacheFrame eye 1, buildSlot has advanced — use publishedSlot instead.
+			// Store predicted display time for this cache slot (for MV extrapolation timing).
+			// After CacheFrame eye 1, buildSlot has advanced — use publishedSlot instead.
+			if (aswEyeCached) {
 				// For eye 0: buildSlot hasn't advanced yet. For eye 1: just published.
 				int dtSlot = (eyeIdx == 1)
 				    ? g_aswProvider->GetPublishedSlot()
@@ -7114,7 +7119,13 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 				s_hasPrevCamZ = true;
 				s_hasPrevActor = true;
 			}
+		} else {
+			g_aswProvider->InvalidateCachedFrame();
 		}
+	} else if (g_aswProvider && g_aswProvider->IsReady()
+	    && g_aswProvider->IsInjectionWanted()) {
+		// Any skipped eye makes the single-buffer stereo pair unusable.
+		g_aswProvider->InvalidateCachedFrame();
 	}
 
 #if defined(OC_HAS_FSR3) || defined(OC_HAS_DLSS)

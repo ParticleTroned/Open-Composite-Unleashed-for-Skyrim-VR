@@ -35,8 +35,10 @@ public:
 	void TryFinishShaderCompilation() {}
 
 	/// Cache current frame's data for warping next cycle.
-	/// Call on each eye during the real frame's Invoke.
-	void CacheFrame(int eye, ID3D11DeviceContext* ctx,
+	/// Call on each eye during the real frame's Invoke. Returns true when this
+	/// eye was cached successfully; eye 1 only succeeds after eye 0 from the
+	/// same cache generation has also succeeded.
+	bool CacheFrame(int eye, ID3D11DeviceContext* ctx,
 	    ID3D11Texture2D* colorTex, const D3D11_BOX* colorRegion,
 	    bool sourceFlipV,
 	    ID3D11Texture2D* mvTex, const D3D11_BOX* mvRegion,
@@ -91,6 +93,11 @@ public:
 	int GetPublishedSlot() const { return m_hasCachedFrame ? 0 : -1; }
 	int GetBuildSlot() const { return 0; }
 	void SetSlotDisplayTime(int slot, XrTime t) { (void)slot; (void)t; }
+	void InvalidateCachedFrame()
+	{
+		m_hasCachedFrame = false;
+		m_cacheBuildEyeMask = 0;
+	}
 
 	/// Cached pose/FOV for building projection views during injection
 	XrPosef GetCachedPose(int eye) const { return m_cachedPose[eye]; }
@@ -170,7 +177,7 @@ public:
 	void SetInjectionWanted(bool wanted)
 	{
 		if (m_injectionWanted && !wanted)
-			m_hasCachedFrame = false;
+			InvalidateCachedFrame();
 		m_injectionWanted = wanted;
 	}
 	bool IsInjectionWanted() const { return m_injectionWanted; }
@@ -241,6 +248,9 @@ private:
 	float m_cachedNear = 0.1f;
 	float m_cachedFar = 10000.0f;
 	bool m_hasCachedFrame = false;
+	// Eyes successfully written for the in-progress generation. A published
+	// frame is never exposed while this mask is non-zero.
+	uint8_t m_cacheBuildEyeMask = 0;
 
 	// Constant buffer layout (must match HLSL, 16-byte aligned = 128 bytes)
 	struct WarpConstants {
