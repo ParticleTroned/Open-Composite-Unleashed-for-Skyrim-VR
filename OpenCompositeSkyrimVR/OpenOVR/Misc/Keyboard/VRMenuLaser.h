@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "Misc/xr_ext.h"
+#include "Misc/PointerState.h"
 #include "Misc/xrutil.h"
 
 class LaserTextureAtlas;
@@ -53,6 +54,10 @@ public:
 	    const bool keyboardHitSide[2],
 	    const bool worldHitSide[2],
 	    const float worldHitDistanceMeters[2]);
+
+    // Draw exactly the externally published ray; the client owns its cursor dot.
+    const std::vector<XrCompositionLayerBaseHeader*>& UpdateExternal(
+        XrTime predictedTime, const ocu_pointer::Presentation& pointer);
 
 	// Query results after Update()
 	bool IsHit(int side) const { return hitActive[side]; }
