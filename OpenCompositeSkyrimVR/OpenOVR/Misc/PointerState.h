@@ -25,7 +25,7 @@ public:
     void CaptureNativeHand(int side);
     void SetNativeCapturedHands(std::uint32_t hands);
     void SetBlockedHands(std::uint32_t hands, std::int64_t now);
-    bool SuppressNative(int side, bool rawDown, std::int64_t now);
+    bool SuppressNative(int side, bool rawDown, std::int64_t now, bool inputAvailable);
     Interest ReadInterest(std::int64_t now);
     Presentation ReadPresentation(std::int64_t now);
 private:

@@ -28,7 +28,9 @@ Consumers serialize their own calls and use a process-unique nonzero token.
    The response reports actual ownership after arbitration.
 5. Only owned hands may produce menu clicks. Raw trigger state and a
    monotonically increasing transition sequence come from internal physical
-   input, bypassing the game-facing mask. Consumers must cancel pending
+   input, bypassing the game-facing mask and legacy frame-count smoothing.
+   Inactive or unfocused actions cannot confirm a physical release.
+   Consumers must cancel pending
    presses and drags when ownership or valid data is lost, and arm a newly
    acquired hand only after release. The sequence counts sampled edges;
    pulses entirely between OpenXR input samples cannot be recovered.

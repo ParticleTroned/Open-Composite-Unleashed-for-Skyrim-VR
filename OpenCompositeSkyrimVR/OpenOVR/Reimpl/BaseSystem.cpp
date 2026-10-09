@@ -684,9 +684,15 @@ namespace {
 void MaskExternalPointerTrigger(vr::TrackedDeviceIndex_t device, vr::VRControllerState_t* state)
 {
     if (device < 1 || device > 2) return;
+    auto& pointer = ocu_pointer::GetPointerState();
+    const auto now = ocu_pointer::PointerClockTicks();
+    if (!pointer.SuppressNative(device - 1, false, now, false)) return;
     const auto triggerMask = vr::ButtonMaskFromId(vr::k_EButton_SteamVR_Trigger);
-    const bool rawDown = (state->ulButtonPressed & triggerMask) || state->rAxis[1].x >= 0.3f;
-    if (!ocu_pointer::GetPointerState().SuppressNative(device - 1, rawDown, ocu_pointer::PointerClockTicks())) return;
+    const auto input = GetBaseInput();
+    bool digital = false;
+    float analog = 0.0f;
+    const bool available = input && input->SamplePhysicalTrigger(device, digital, analog);
+    if (!pointer.SuppressNative(device - 1, digital || analog >= 0.3f, now, available)) return;
     state->ulButtonPressed &= ~triggerMask;
     state->ulButtonTouched &= ~triggerMask;
     state->rAxis[1] = {};
@@ -721,7 +727,6 @@ bool BaseSystem::GetControllerState(vr::TrackedDeviceIndex_t controllerDeviceInd
 	bool ok = inputSystem->GetLegacyControllerState(controllerDeviceIndex, controllerState);
 
     if (ok) MaskExternalPointerTrigger(controllerDeviceIndex, controllerState);
-
 
 	// Mask controller input when a laser owns its synthetic click path. The
 	// keyboard owns several controls; the flat-menu bridge owns only trigger.

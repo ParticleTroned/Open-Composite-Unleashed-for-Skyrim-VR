@@ -64,10 +64,10 @@ void PublishPointerFrame()
     }
     for (int side = 0; side < 2; ++side) {
         auto& hand = value.hands[side];
-        vr::VRControllerState_t raw{};
-        if (sys->IsInputAvailable() && input && input->AreActionsLoaded() && input->GetLegacyControllerState(side + 1, &raw)) {
-            const bool digital = (raw.ulButtonPressed & vr::ButtonMaskFromId(vr::k_EButton_SteamVR_Trigger)) != 0;
-            trigger[side] = digital || raw.rAxis[1].x >= (trigger[side] ? 0.3f : 0.7f);
+        bool digital = false;
+        float analog = 0.0f;
+        if (sys->IsInputAvailable() && input && input->SamplePhysicalTrigger(side + 1, digital, analog)) {
+            trigger[side] = digital || analog >= (trigger[side] ? 0.3f : 0.7f);
             hand.flags = InputAvailable | (trigger[side] ? TriggerDown : 0u);
         } else {
             trigger[side] = false;

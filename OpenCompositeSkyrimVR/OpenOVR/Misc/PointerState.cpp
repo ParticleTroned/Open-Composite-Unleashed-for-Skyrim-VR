@@ -165,12 +165,12 @@ void State::SetBlockedHands(std::uint32_t hands, std::int64_t now)
     Drop(owned & blocked);
     Decorate();
 }
-bool State::SuppressNative(int side, bool rawDown, std::int64_t now)
+bool State::SuppressNative(int side, bool rawDown, std::int64_t now, bool inputAvailable)
 {
     if (side < 0 || side > 1) return false;
     std::lock_guard<std::mutex> lock(mutex);
     Expire(now);
-    if (!rawDown) guarded &= ~(1u << side);
+    if (inputAvailable && !rawDown) guarded &= ~(1u << side);
     return ((owned | guarded) & (1u << side)) != 0;
 }
 Interest State::ReadInterest(std::int64_t now)
