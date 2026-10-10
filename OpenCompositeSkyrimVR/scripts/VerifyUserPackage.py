@@ -6,6 +6,7 @@ in development tooling; it is not part of the installed mod.
 import argparse
 import hashlib
 import json
+import re
 from pathlib import Path, PurePosixPath
 import struct
 import zipfile
@@ -57,7 +58,51 @@ def exports(data):
     return result
 
 
-def verify(package):
+def verify_menu_lasers(read):
+    """Require both native menu-laser gates for an explicitly enabled package."""
+    enabled = False
+    for line in read("root/menu_quad_settings.ini").splitlines():
+        # The calibration reader uses sscanf from the start of each line.
+        match = re.match(br"enable_laser=[ \t\r\n\v\f]*([+-]?[0-9]+)", line)
+        if match:
+            enabled = int(match[1]) != 0
+    assert enabled, "Native menu lasers disabled by root/menu_quad_settings.ini: enable_laser"
+
+    root_sections = {
+        "", "default", "general", "audio", "input", "controller_pose",
+        "laser_aim", "upscaling", "fsr", "fsr3", "dlss", "motion_vectors",
+        "asw", "cas", "mip_bias", "vrs", "debug",
+    }
+    section, previous_name = "", ""
+    enabled = True
+    whitespace = " \t\r\n\v\f"
+    for raw_line in read("root/opencomposite.ini").decode("utf-8-sig").splitlines():
+        line = raw_line.strip(whitespace)
+        if not line or line.startswith((";", "#")):
+            continue
+        # inih passes indented continuation values to the preceding key.
+        if previous_name and raw_line[0] in whitespace:
+            name, value = previous_name, line
+        elif line.startswith("[") and "]" in line:
+            section = line[1:line.index("]")]
+            previous_name = ""
+            continue
+        else:
+            match = re.match(r"([^=:]+)[=:](.*)", line)
+            if not match:
+                continue
+            name = match[1].rstrip(whitespace)
+            value = re.split(r"[ \t\r\n\v\f]+;", match[2], maxsplit=1)[0].strip(whitespace)
+            previous_name = name
+        if section in root_sections and name == "menuLaserEnabled":
+            value = value.lower()
+            assert value in {"true", "on", "enabled", "false", "off", "disabled"}, (
+                "Invalid menuLaserEnabled boolean in root/opencomposite.ini")
+            enabled = value in {"true", "on", "enabled"}
+    assert enabled, "Native menu lasers disabled by root/opencomposite.ini: menuLaserEnabled"
+
+
+def verify(package, require_menu_lasers=False):
     archive = None
     try:
         if package.is_dir():
@@ -74,6 +119,8 @@ def verify(package):
             assert not p.is_absolute() and ".." not in p.parts and "\\" not in name, f"Invalid path: {name}"
         missing = sorted(REQUIRED - set(names))
         assert not missing, "Missing required user files: " + ", ".join(missing)
+        if require_menu_lasers:
+            verify_menu_lasers(read)
         definition = {}
         for line in read("Interface/controls/pc/oculuscontroller.txt").decode("utf-8-sig").splitlines():
             if not line.strip() or line.startswith("//"):
@@ -110,8 +157,10 @@ def verify(package):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("package", type=Path)
+    parser.add_argument("--require-menu-lasers", action="store_true",
+                        help="Require enabled native menu lasers in a laser-enabled test package")
     args = parser.parse_args()
     try:
-        print(json.dumps(verify(args.package), indent=2))
+        print(json.dumps(verify(args.package, args.require_menu_lasers), indent=2))
     except (AssertionError, OSError, ValueError, struct.error, zipfile.BadZipFile) as error:
         parser.exit(1, f"PACKAGE REJECTED: {error}\n")

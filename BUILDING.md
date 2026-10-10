@@ -104,4 +104,20 @@ definitions, duplicate paths, and developer files accidentally included in a
 package. Compare its reported component hashes with the intended build outputs.
 Keep this development script outside the user-facing mod package.
 
+For a test package that promises native game-menu lasers, also pass
+`--require-menu-lasers`. That check requires `enable_laser=1` in the
+packaged `root/menu_quad_settings.ini` and an enabled or default
+`menuLaserEnabled` in `root/opencomposite.ini`; normal package validation
+still accepts intentional user opt-outs. The calibration reader's dormant
+`enable_laser=0` fallback is not a suitable enabled test-package default.
+
+Runtime updates preserve existing `menu_quad_settings.ini` calibration,
+including settings saved while an installation confirmation is open.
+If an enabled test package previously replaced this file with
+`enable_laser=0`, change only that key in the active file and retain the
+other calibration values. An explicit `menuLaserEnabled=false` remains
+a separate opt-out.
+The Configurator's menu-laser checkbox controls that second gate; enabling
+it does not repair a disabled calibration-file gate.
+
 These instructions were checked against the current project files, local configured build caches and output locations. They do **not** claim a clean-clone build with newly acquired SDK/CommonLib dependencies, native Linux compilation, or headset performance qualification. CMake regression targets are generally `EXCLUDE_FROM_ALL` and must be built and run explicitly; building `OCOVR` alone does not run them.
