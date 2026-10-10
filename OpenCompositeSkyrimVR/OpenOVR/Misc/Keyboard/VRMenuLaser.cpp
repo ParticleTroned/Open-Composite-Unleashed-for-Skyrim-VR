@@ -931,16 +931,18 @@ const std::vector<XrCompositionLayerBaseHeader*>& VRMenuLaser::UpdateExternal(
     XrTime predictedTime, const ocu_pointer::Presentation& pointer)
 {
     activeLayers.clear();
-    const auto& state = pointer.snapshot;
-    if (!state.ownedHands || pointer.lease.frameId != state.frameId ||
-        pointer.lease.sessionId != state.sessionId) return activeLayers;
+    const auto& state = pointer.renderSnapshot;
+    const auto ownedHands = state.ownedHands & pointer.snapshot.ownedHands;
+    if (!ownedHands || pointer.lease.frameId != state.frameId ||
+        pointer.lease.sessionId != state.sessionId || state.sessionId != pointer.snapshot.sessionId ||
+        state.trackingOrigin != pointer.snapshot.trackingOrigin) return activeLayers;
     const XrSpace space = xr_space_from_ref_space_type(GetUnsafeBaseSystem()->currentSpace);
     XrSpaceLocation head{ XR_TYPE_SPACE_LOCATION };
     if (XR_FAILED(xrLocateSpace(xr_gbl->viewSpace, space, predictedTime, &head)) ||
         !(head.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT)) return activeLayers;
     for (int side = 0; side < 2; ++side) {
         const auto& hand = state.hands[side];
-        if (!(state.ownedHands & (1u << side)) || !(hand.flags & ocu_pointer::RayValid) ||
+        if (!(ownedHands & (1u << side)) || !(hand.flags & ocu_pointer::RayValid) ||
             !(pointer.lease.flags & (ocu_pointer::HasLeftHit << side))) continue;
         beamLayer[side].space = space;
         const XrVector3f origin{ hand.origin[0], hand.origin[1], hand.origin[2] };

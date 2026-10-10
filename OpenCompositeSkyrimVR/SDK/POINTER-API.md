@@ -44,6 +44,13 @@ publication arrives. Tracking loss, recenter, origin changes, session
 shutdown and lease expiry revoke ownership. No endpoint from a previous
 publication is drawn against a newer ray.
 
+An accepted hit retains its exact ray publication for rendering when the
+next tracking frame arrives before layer submission. Input queries still
+return the latest tracking frame. The retained publication must remain
+fresh within 100 ms and loses rendering ownership immediately on tracking
+loss, keyboard preemption, session changes or lease expiry. A renewal
+without hit flags hides the beam while retaining valid drag ownership.
+
 ## Input and display ownership
 
 An existing native menu/console trigger hold keeps its hand until release.
@@ -81,6 +88,7 @@ cmake --build OpenCompositeSkyrimVR/build --config Release --target OCUPointerSt
 
 The pointer policy test covers bootstrap, token exclusion, native holds,
 keyboard handoff, expiry, release guards, raw trigger transitions, stale
-endpoints, pitch changes, argument validation and session epochs. A headset
+endpoints, retained presentation across tracking frames, pitch changes,
+argument validation and session epochs. A headset
 check should also cover a consumer-only menu, two-hand aiming, rapid clicks,
 dragging off the menu, keyboard opening, recenter and disconnect/reconnect.

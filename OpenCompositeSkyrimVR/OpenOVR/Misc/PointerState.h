@@ -12,6 +12,8 @@ struct Interest {
 struct Presentation {
     Snapshot snapshot{};
     LeaseRequest lease{};
+    // Accepted ray publication; current arbitration still comes from snapshot.
+    Snapshot renderSnapshot{};
 };
 
 // CPU-only publication and ownership policy, independent of OpenXR and graphics.
@@ -31,9 +33,10 @@ public:
 private:
     void Expire(std::int64_t now);
     void Drop(std::uint32_t hands);
-    void Decorate();
+    void Decorate(Snapshot& value);
     std::mutex mutex;
     Snapshot snapshot{};
+    Snapshot acceptedSnapshot{};
     LeaseRequest lease{};
     std::int64_t expires = 0;
     std::uint64_t sessionKey = 0, spaceKey = 0, epoch = 0, generation = 0;

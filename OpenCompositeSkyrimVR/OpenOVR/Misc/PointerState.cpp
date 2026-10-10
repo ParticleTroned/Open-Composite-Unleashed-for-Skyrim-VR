@@ -8,6 +8,13 @@
 #endif
 
 namespace ocu_pointer {
+namespace {
+bool IsFresh(const Snapshot& value, std::int64_t now)
+{
+    return value.publicationQpc > 0 && value.qpcFrequency > 0 && now >= value.publicationQpc &&
+        double(now - value.publicationQpc) <= double(value.qpcFrequency) * double(MaximumLeaseMilliseconds) / 1000.0;
+}
+}
 void State::Drop(std::uint32_t hands)
 {
     guarded |= hands;
@@ -18,23 +25,23 @@ void State::Expire(std::int64_t now)
     if (lease.clientToken && (now <= 0 || now >= expires || now < snapshot.publicationQpc)) {
         Drop(owned);
         lease = {};
+        acceptedSnapshot = {};
         expires = 0;
     }
-    if (snapshot.qpcFrequency <= 0 || now < snapshot.publicationQpc ||
-        double(now - snapshot.publicationQpc) > double(snapshot.qpcFrequency) * 0.1) {
+    if (!IsFresh(snapshot, now)) {
         Drop(owned);
         for (auto& hand : snapshot.hands) hand.flags &= ~(RayValid | InputAvailable);
     }
 }
-void State::Decorate()
+void State::Decorate(Snapshot& value)
 {
-    snapshot.structSize = sizeof(snapshot);
-    snapshot.version = Version;
-    snapshot.clientToken = lease.clientToken;
-    snapshot.ownedHands = owned;
+    value.structSize = sizeof(value);
+    value.version = Version;
+    value.clientToken = lease.clientToken;
+    value.ownedHands = owned;
     for (int side = 0; side < 2; ++side) {
-        snapshot.hands[side].flags &= ~SuppressedUntilRelease;
-        if (guarded & (1u << side)) snapshot.hands[side].flags |= SuppressedUntilRelease;
+        value.hands[side].flags &= ~SuppressedUntilRelease;
+        if (guarded & (1u << side)) value.hands[side].flags |= SuppressedUntilRelease;
     }
 }
 Result State::Query(std::uint32_t version, std::uint32_t bytes, Snapshot* output, std::int64_t now)
@@ -43,7 +50,7 @@ Result State::Query(std::uint32_t version, std::uint32_t bytes, Snapshot* output
     if (!output || bytes < sizeof(Snapshot)) return Result::InvalidArgument;
     std::lock_guard<std::mutex> lock(mutex);
     Expire(now);
-    Decorate();
+    Decorate(snapshot);
     std::memcpy(output, &snapshot, sizeof(snapshot));
     return Result::Success;
 }
@@ -72,13 +79,12 @@ Result State::Update(std::uint32_t version, std::uint32_t bytes, const LeaseRequ
     if (!value.flags) {
         Drop(owned);
         lease = {};
+        acceptedSnapshot = {};
         expires = 0;
     } else {
         const bool bootstrap = value.handMask == 0 && value.sessionId == 0 && value.frameId == 0;
         if (!bootstrap && (value.sessionId != snapshot.sessionId || value.frameId != snapshot.frameId ||
-            value.trackingOrigin != snapshot.trackingOrigin || snapshot.publicationQpc <= 0 ||
-            snapshot.qpcFrequency <= 0 || now < snapshot.publicationQpc ||
-            double(now - snapshot.publicationQpc) > double(snapshot.qpcFrequency) * 0.1))
+            value.trackingOrigin != snapshot.trackingOrigin || !IsFresh(snapshot, now)))
             return Result::Stale;
         std::uint32_t granted = value.handMask & ~(blocked | nativeCaptured);
         for (int side = 0; side < 2; ++side)
@@ -96,10 +102,11 @@ Result State::Update(std::uint32_t version, std::uint32_t bytes, const LeaseRequ
                 guarded |= 1u << side;
         owned = granted;
         lease = value;
+        acceptedSnapshot = snapshot;
         const auto frequency = PointerClockFrequency();
         expires = now + frequency * value.leaseMilliseconds / 1000;
     }
-    Decorate();
+    Decorate(snapshot);
     *output = { sizeof(LeaseResponse), Version, snapshot.sessionId, snapshot.frameId, owned, 0 };
     return Result::Success;
 }
@@ -112,6 +119,7 @@ void State::Publish(std::uint64_t newSession, std::uint64_t newSpace, const Snap
     if (changed) {
         Drop(owned);
         if (sessionKey) { lease = {}; expires = 0; }
+        acceptedSnapshot = {};
         sessionKey = newSession;
         spaceKey = newSpace;
         ++epoch;
@@ -133,13 +141,14 @@ void State::Publish(std::uint64_t newSession, std::uint64_t newSpace, const Snap
             Drop(owned & (1u << side));
     }
     snapshot = next;
-    Decorate();
+    Decorate(snapshot);
 }
 void State::Reset()
 {
     std::lock_guard<std::mutex> lock(mutex);
     Drop(owned);
     snapshot = {};
+    acceptedSnapshot = {};
     lease = {};
     expires = 0;
     sessionKey = spaceKey = 0;
@@ -163,7 +172,7 @@ void State::SetBlockedHands(std::uint32_t hands, std::int64_t now)
     Expire(now);
     blocked = hands & 3u;
     Drop(owned & blocked);
-    Decorate();
+    Decorate(snapshot);
 }
 bool State::SuppressNative(int side, bool rawDown, std::int64_t now, bool inputAvailable)
 {
@@ -183,8 +192,12 @@ Presentation State::ReadPresentation(std::int64_t now)
 {
     std::lock_guard<std::mutex> lock(mutex);
     Expire(now);
-    Decorate();
-    return { snapshot, lease };
+    Decorate(snapshot);
+    Snapshot render = acceptedSnapshot;
+    Decorate(render);
+    if (!IsFresh(render, now) || render.sessionId != snapshot.sessionId ||
+        render.trackingOrigin != snapshot.trackingOrigin) render.ownedHands = 0;
+    return { snapshot, lease, render };
 }
 State& GetPointerState() { static State value; return value; }
 std::int64_t PointerClockTicks()
