@@ -2574,7 +2574,7 @@ int BaseOverlay::_BuildLayers(XrCompositionLayerBaseHeader* sceneLayer, XrCompos
 	static float s_mqMouseScaleX = 1.0f;  // UV scale multiplier for X
 	static float s_mqMouseScaleY = 1.0f;  // UV scale multiplier for Y
 	// Quad mode flags — controlled from Menu Quad Calibrator app
-	static bool  s_mqShowCalibQuad = true;  // Show the movable green calibration quad
+	static bool  s_mqShowCalibQuad = false; // Calibration grids require an explicit opt-in
 	static bool  s_mqShowProfileQuad = false; // Show pink profile quads (analysis mode)
 	static bool  s_mqShowSfCursor = false; // Tell SKSE to make Scaleform cursor visible
 	// (s_mqShowProfileQuad_prev and s_mqForceProfileReload removed —

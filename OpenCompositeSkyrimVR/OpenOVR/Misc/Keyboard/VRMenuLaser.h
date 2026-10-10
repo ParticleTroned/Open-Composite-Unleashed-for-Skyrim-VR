@@ -106,7 +106,7 @@ private:
 	XrPosef menuPose = { { 0, 0, 0, 1 }, { 0, 0, 0 } };
 	XrExtent2Df menuSize = { 0, 0 };
 	bool menuValid = false;
-	bool showDebugQuad = true;
+	bool showDebugQuad = false;
 	int debugOpacityPercent = 20;
 	int debugColorR = 30, debugColorG = 100, debugColorB = 30; // fill color (default green)
 

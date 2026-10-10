@@ -59,14 +59,18 @@ def exports(data):
 
 
 def verify_menu_lasers(read):
-    """Require both native menu-laser gates for an explicitly enabled package."""
-    enabled = False
+    """Require native menu lasers without calibration or profile overlays."""
+    switches = dict.fromkeys((b"enable_laser", b"always_show_quad",
+                              b"show_calibration_quad", b"show_profile_quad"))
     for line in read("root/menu_quad_settings.ini").splitlines():
         # The calibration reader uses sscanf from the start of each line.
-        match = re.match(br"enable_laser=[ \t\r\n\v\f]*([+-]?[0-9]+)", line)
+        match = re.match(br"(enable_laser|always_show_quad|show_calibration_quad|show_profile_quad)=[ \t\r\n\v\f]*([+-]?[0-9]+)", line)
         if match:
-            enabled = int(match[1]) != 0
-    assert enabled, "Native menu lasers disabled by root/menu_quad_settings.ini: enable_laser"
+            switches[match[1]] = int(match[2]) != 0
+    assert switches[b"enable_laser"], "Native menu lasers disabled by root/menu_quad_settings.ini: enable_laser"
+    for name in (b"always_show_quad", b"show_calibration_quad", b"show_profile_quad"):
+        assert switches[name] is False, (
+            f"Normal-play laser packages require explicit {name.decode()}=0 in root/menu_quad_settings.ini")
 
     root_sections = {
         "", "default", "general", "audio", "input", "controller_pose",
@@ -158,7 +162,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("package", type=Path)
     parser.add_argument("--require-menu-lasers", action="store_true",
-                        help="Require enabled native menu lasers in a laser-enabled test package")
+                        help="Require native menu lasers with calibration/profile quads explicitly disabled")
     args = parser.parse_args()
     try:
         print(json.dumps(verify(args.package, args.require_menu_lasers), indent=2))

@@ -10,8 +10,11 @@ spec.loader.exec_module(package)
 
 
 class MenuLaserPackageTests(unittest.TestCase):
-    def verify(self, quad="enable_laser=1\n", config=""):
-        data = {"root/menu_quad_settings.ini": quad.encode(),
+    quad_modes = "always_show_quad=0\nshow_calibration_quad=0\nshow_profile_quad=0\n"
+
+    def verify(self, quad="enable_laser=1\n", config="", modes=None):
+        modes = self.quad_modes if modes is None else modes
+        data = {"root/menu_quad_settings.ini": (modes + quad).encode(),
                 "root/opencomposite.ini": config.encode()}
         package.verify_menu_lasers(data.__getitem__)
 
@@ -69,6 +72,27 @@ class MenuLaserPackageTests(unittest.TestCase):
         self.verify(config="menuLaserEnabled=false\n ON\n")
         with self.assertRaisesRegex(AssertionError, "Invalid"):
             self.verify(config="menuLaserEnabled=true\n false ; continuation is verbatim\n")
+
+    def test_enabled_diagnostic_quad_rejected(self):
+        for name in ("always_show_quad", "show_calibration_quad", "show_profile_quad"):
+            for value in ("1", "-1", " +1"):
+                with self.subTest(name=name, value=value):
+                    with self.assertRaisesRegex(AssertionError, name):
+                        self.verify("enable_laser=1\n" + name + "=" + value + "\n")
+
+    def test_explicit_quiet_defaults_required(self):
+        for line in self.quad_modes.splitlines(keepends=True):
+            with self.subTest(line=line):
+                with self.assertRaisesRegex(AssertionError, line.split("=")[0]):
+                    self.verify(modes=self.quad_modes.replace(line, ""))
+
+    def test_diagnostic_flags_follow_native_reader(self):
+        self.verify("enable_laser=1\nshow_calibration_quad=1\nshow_calibration_quad=0\n")
+        for line in (" show_calibration_quad=0", "Show_calibration_quad=0",
+                     ";show_calibration_quad=0", "show_calibration_quad=\u0660"):
+            with self.subTest(line=line):
+                with self.assertRaisesRegex(AssertionError, "show_calibration_quad"):
+                    self.verify("enable_laser=1\nshow_calibration_quad=1\n" + line + "\n")
 
     def test_invalid_global_boolean_rejected(self):
         with self.assertRaisesRegex(AssertionError, "Invalid"):
